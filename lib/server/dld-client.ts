@@ -11,9 +11,10 @@
 
 const DLD_GATEWAY   = 'https://gateway.dubailand.gov.ae/open-data';
 const RENTAL_INDEX  = 'https://ext.dubailand.gov.ae/rentalindex';
+// consumer-id is the header name used in the DLD portal's own boot-1.0.4.js (buildHeaders fn)
 const CONSUMER_KEY  = process.env.DLD_CONSUMER_KEY ?? 'lMR2xhC1OyK1t46MgjyVv0W8mit4cGN2';
 const MIN_GAP_MS    = 800;   // min ms between requests to same base URL
-const TIMEOUT_MS    = 10_000;
+const TIMEOUT_MS    = 15_000;
 
 // Per-base-URL rate limiter (module-level, resets on cold start)
 const lastCall: Record<string, number> = {};
@@ -45,12 +46,14 @@ export async function dldPost<T = unknown>(
   const res = await fetch(url, {
     method:  'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'Accept':        'application/json',
-      'consumer-key':  CONSUMER_KEY,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json, */*',
+      // DLD portal boot.js buildHeaders() uses 'consumer-id' (not 'consumer-key')
+      'consumer-id':   CONSUMER_KEY,
+      'AppUser':       '',
       'Origin':        'https://dubailand.gov.ae',
       'Referer':       'https://dubailand.gov.ae/en/open-data/real-estate-data/',
-      'User-Agent':    'Mozilla/5.0 (compatible; PropMapDubai/1.0)',
+      'User-Agent':    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     },
     body:   JSON.stringify(params),
     signal: timeoutSignal(TIMEOUT_MS),
