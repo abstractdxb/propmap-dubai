@@ -12,6 +12,7 @@ import {
   buildingsToGeoJSON, generateTransactions,
   type Building, type Transaction,
 } from '@/lib/data';
+import type { DLDTransaction, DLDRent } from '@/lib/server/dld-client';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement,
   BarElement, ArcElement, Filler, Tooltip, Legend);
@@ -170,6 +171,10 @@ export default function MapApp() {
   const mapRef       = useRef<mapboxgl.Map | null>(null);
 
   const [plan,          setPlan]          = useState<Plan | null>(null);
+  const [liveTx,        setLiveTx]        = useState<DLDTransaction[] | null>(null);
+  const [liveRents,     setLiveRents]     = useState<DLDRent[] | null>(null);
+  const [txLoading,     setTxLoading]     = useState(false);
+  const [dataSource,    setDataSource]    = useState<'live' | 'mock' | null>(null);
   const hasToken = Boolean(process.env.NEXT_PUBLIC_MAPBOX_TOKEN);
   const [building,      setBuilding]      = useState<Building | null>(null);
   const [transactions,  setTransactions]  = useState<Transaction[]>([]);
@@ -369,9 +374,95 @@ export default function MapApp() {
     map.setFilter('building-labels', conditions as mapboxgl.FilterSpecification);
   }, [filters]);
 
-  // ── Generate transactions when building changes
+  // ── Fetch live DLD data when building changes
   useEffect(() => {
-    if (building) setTransactions(generateTransactions(building, building.totalTx));
+    if (!building) return;
+
+    // Always show mock data immediately so panel is never empty
+    setTransactions(generateTransactions(building, building.totalTx));
+    setLiveTx(null);
+    setLiveRents(null);
+    setDataSource(null);
+    setTxLoading(true);
+
+    // Date range: last 2 years
+    const to   = new Date();
+    const from = new Date();
+    from.setFullYear(from.getFullYear() - 2);
+    const fmt = (d: Date) =>
+      `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+
+    // First get area ID, then fetch transactions + rents in parallel
+    const controller = new AbortController();
+
+    async function fetchLiveData() {
+      try {
+        // 1. Resolve area ID from community name
+        const areasRes = await fetch('/api/dld/areas', { signal: controller.signal });
+        if (!areasRes.ok) throw new Error('areas fetch failed');
+        const areasJson = await areasRes.json() as {
+          data: { result: Array<{ AREA_ID: number; AREA_EN: string }> }
+        };
+        const areas = areasJson?.data?.result ?? [];
+        const match = areas.find(
+          a => a.AREA_EN?.toLowerCase() === building.community.toLowerCase()
+        );
+        const areaId = match?.AREA_ID ? String(match.AREA_ID) : '';
+
+        // 2. Fetch transactions + rents in parallel (800ms gap handled server-side)
+        const txParams = new URLSearchParams({
+          from:    fmt(from),
+          to:      fmt(to),
+          areaId:  areaId,
+          take:    '50',
+          skip:    '0',
+        });
+        const rentParams = new URLSearchParams({
+          from:    fmt(from),
+          to:      fmt(to),
+          areaId:  areaId,
+          take:    '25',
+          skip:    '0',
+        });
+
+        const [txRes, rentRes] = await Promise.all([
+          fetch(`/api/dld/transactions?${txParams}`, { signal: controller.signal }),
+          fetch(`/api/dld/rents?${rentParams}`,      { signal: controller.signal }),
+        ]);
+
+        if (txRes.ok) {
+          const txJson = await txRes.json() as {
+            data: { result: DLDTransaction[] }; source: string
+          };
+          const rows = txJson?.data?.result ?? [];
+          if (rows.length) {
+            setLiveTx(rows);
+            setDataSource('live');
+          } else {
+            setDataSource('mock');
+          }
+        } else {
+          setDataSource('mock');
+        }
+
+        if (rentRes.ok) {
+          const rentJson = await rentRes.json() as {
+            data: { result: DLDRent[] }
+          };
+          setLiveRents(rentJson?.data?.result ?? []);
+        }
+      } catch (e: unknown) {
+        if ((e as Error).name !== 'AbortError') {
+          console.warn('[PropMap] DLD fetch failed, using mock data', e);
+          setDataSource('mock');
+        }
+      } finally {
+        setTxLoading(false);
+      }
+    }
+
+    fetchLiveData();
+    return () => controller.abort();
   }, [building]);
 
   // ── Map style change
@@ -682,56 +773,135 @@ export default function MapApp() {
             {/* ── Transactions */}
             {activeTab === 'transactions' && (
               <div className="p-4">
-                <div className="flex items-center justify-between mb-3">
-                  <span className="text-[11px] text-[#64748b]">Showing {txDisplay} of {building.totalTx}</span>
+                {/* Header row */}
+                <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    {txLoading ? (
+                      <span className="text-[11px] text-[#64748b] flex items-center gap-1.5">
+                        <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-t-transparent border-[#3b82f6] animate-spin" />
+                        Fetching DLD data…
+                      </span>
+                    ) : (
+                      <>
+                        <span className="text-[11px] text-[#64748b]">
+                          {liveTx ? `${Math.min(liveTx.length, showAll ? 50 : 10)} of ${liveTx[0]?.TOTAL ?? liveTx.length} DLD records` : `${txDisplay} of ${building.totalTx}`}
+                        </span>
+                        {dataSource && (
+                          <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded"
+                            style={{
+                              background: dataSource === 'live' ? 'rgba(16,185,129,.15)' : 'rgba(245,158,11,.15)',
+                              color:      dataSource === 'live' ? '#10b981'              : '#f59e0b',
+                            }}>
+                            {dataSource === 'live' ? '✓ DLD Live' : '⚠ Demo data'}
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </div>
                   <select className="text-[11px] rounded-md px-2 py-1 border outline-none"
                     style={{ background:'#1e2330', borderColor:'#2a3040', color:'#e2e8f0' }}>
                     <option>All Types</option><option>Sales</option><option>Rentals</option><option>Mortgage</option>
                   </select>
                 </div>
-                <table className="w-full border-collapse">
-                  <thead>
-                    <tr style={{ borderBottom:'1px solid #2a3040' }}>
-                      {['Date','Type','Beds','sqft','Price (AED)','PSF'].map(h=>(
-                        <th key={h} className="text-left py-2 px-2 text-[10px] font-bold uppercase tracking-wide text-[#64748b] last:text-right">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {transactions.slice(0, txDisplay).map((tx, i) => {
-                      const blurred = !showAll && i >= 10;
-                      const typeColors: Record<string,{bg:string;text:string}> = {
-                        sale:     { bg:'rgba(59,130,246,.15)',  text:'#3b82f6' },
-                        rent:     { bg:'rgba(16,185,129,.15)',  text:'#10b981' },
-                        mortgage: { bg:'rgba(245,158,11,.15)',  text:'#f59e0b' },
-                      };
-                      return (
-                        <tr key={i} style={{ opacity:blurred?.3:1, filter:blurred?'blur(4px)':'none', userSelect:blurred?'none':'auto', borderBottom:'1px solid rgba(42,48,64,.4)' }}>
-                          <td className="py-2 px-2 text-[11px] text-[#94a3b8]">{tx.date}</td>
-                          <td className="py-2 px-2">
-                            <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
-                              style={{ background:typeColors[tx.type].bg, color:typeColors[tx.type].text }}>
-                              {tx.type}
-                            </span>
-                          </td>
-                          <td className="py-2 px-2 text-[11px]">{tx.bed}</td>
-                          <td className="py-2 px-2 text-[11px] text-right">{tx.area.toLocaleString()}</td>
-                          <td className="py-2 px-2 text-[11px] font-semibold text-right">{tx.price.toLocaleString()}</td>
-                          <td className="py-2 px-2 text-[11px] text-[#64748b] text-right">{tx.psf ?? '—'}</td>
+
+                {/* Live DLD table */}
+                {liveTx && liveTx.length > 0 ? (
+                  <>
+                    <table className="w-full border-collapse">
+                      <thead>
+                        <tr style={{ borderBottom:'1px solid #2a3040' }}>
+                          {['Date','Type','Beds','Size (sqm)','Amount (AED)','Project'].map(h=>(
+                            <th key={h} className="text-left py-2 px-2 text-[10px] font-bold uppercase tracking-wide text-[#64748b]">{h}</th>
+                          ))}
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-                {!showAll && (
-                  <div className="mt-4 rounded-lg p-4 text-center border" style={{ background:'linear-gradient(135deg,rgba(59,130,246,.08),rgba(16,185,129,.06))', borderColor:'#3b82f6' }}>
-                    <div className="text-sm font-bold mb-1">🔓 Unlock Full Transaction History</div>
-                    <div className="text-[11px] text-[#94a3b8] mb-3">Upgrade to Pro to see all {building.totalTx} transactions with buyer nationality, unit number & export.</div>
-                    <button onClick={() => showToast('Stripe checkout coming soon!')}
-                      className="px-5 py-2 rounded-lg text-xs font-bold text-white" style={{ background:'#3b82f6' }}>
-                      Upgrade to Pro — $25/mo
-                    </button>
-                  </div>
+                      </thead>
+                      <tbody>
+                        {liveTx.slice(0, showAll ? 50 : 10).map((tx, i) => {
+                          const blurred = !showAll && i >= 10;
+                          const type    = tx.TRANSACTION_TYPE_EN?.toLowerCase().includes('rent') ? 'rent'
+                            : tx.TRANSACTION_TYPE_EN?.toLowerCase().includes('mort') ? 'mortgage' : 'sale';
+                          const typeColors: Record<string,{bg:string;text:string}> = {
+                            sale:     { bg:'rgba(59,130,246,.15)',  text:'#3b82f6' },
+                            rent:     { bg:'rgba(16,185,129,.15)',  text:'#10b981' },
+                            mortgage: { bg:'rgba(245,158,11,.15)',  text:'#f59e0b' },
+                          };
+                          return (
+                            <tr key={i} style={{ opacity:blurred?.3:1, filter:blurred?'blur(4px)':'none', userSelect:blurred?'none':'auto', borderBottom:'1px solid rgba(42,48,64,.4)' }}>
+                              <td className="py-2 px-2 text-[11px] text-[#94a3b8]">{tx.INSTANCE_DATE?.split(' ')[0]}</td>
+                              <td className="py-2 px-2">
+                                <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
+                                  style={{ background:typeColors[type].bg, color:typeColors[type].text }}>
+                                  {tx.TRANSACTION_TYPE_EN ?? type}
+                                </span>
+                              </td>
+                              <td className="py-2 px-2 text-[11px]">{tx.ROOMS_EN ?? '—'}</td>
+                              <td className="py-2 px-2 text-[11px] text-right">{tx.PROPERTY_SIZE_SQM ? Math.round(tx.PROPERTY_SIZE_SQM).toLocaleString() : '—'}</td>
+                              <td className="py-2 px-2 text-[11px] font-semibold text-right">{tx.AMOUNT ? tx.AMOUNT.toLocaleString() : '—'}</td>
+                              <td className="py-2 px-2 text-[11px] text-[#64748b] max-w-[80px] truncate">{tx.PROJECT_EN ?? '—'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    {!showAll && (
+                      <div className="mt-4 rounded-lg p-4 text-center border" style={{ background:'linear-gradient(135deg,rgba(59,130,246,.08),rgba(16,185,129,.06))', borderColor:'#3b82f6' }}>
+                        <div className="text-sm font-bold mb-1">🔓 Unlock Full Transaction History</div>
+                        <div className="text-[11px] text-[#94a3b8] mb-3">Upgrade to Pro to see all {liveTx[0]?.TOTAL ?? liveTx.length} DLD-verified transactions with buyer nationality, unit number & export.</div>
+                        <button onClick={() => showToast('Stripe checkout coming soon!')}
+                          className="px-5 py-2 rounded-lg text-xs font-bold text-white" style={{ background:'#3b82f6' }}>
+                          Upgrade to Pro — $25/mo
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  /* Fallback: mock data table */
+                  <>
+                    <table className="w-full border-collapse">
+                      <thead>
+                        <tr style={{ borderBottom:'1px solid #2a3040' }}>
+                          {['Date','Type','Beds','sqft','Price (AED)','PSF'].map(h=>(
+                            <th key={h} className="text-left py-2 px-2 text-[10px] font-bold uppercase tracking-wide text-[#64748b] last:text-right">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {transactions.slice(0, txDisplay).map((tx, i) => {
+                          const blurred = !showAll && i >= 10;
+                          const typeColors: Record<string,{bg:string;text:string}> = {
+                            sale:     { bg:'rgba(59,130,246,.15)',  text:'#3b82f6' },
+                            rent:     { bg:'rgba(16,185,129,.15)',  text:'#10b981' },
+                            mortgage: { bg:'rgba(245,158,11,.15)',  text:'#f59e0b' },
+                          };
+                          return (
+                            <tr key={i} style={{ opacity:blurred?.3:1, filter:blurred?'blur(4px)':'none', userSelect:blurred?'none':'auto', borderBottom:'1px solid rgba(42,48,64,.4)' }}>
+                              <td className="py-2 px-2 text-[11px] text-[#94a3b8]">{tx.date}</td>
+                              <td className="py-2 px-2">
+                                <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
+                                  style={{ background:typeColors[tx.type].bg, color:typeColors[tx.type].text }}>
+                                  {tx.type}
+                                </span>
+                              </td>
+                              <td className="py-2 px-2 text-[11px]">{tx.bed}</td>
+                              <td className="py-2 px-2 text-[11px] text-right">{tx.area.toLocaleString()}</td>
+                              <td className="py-2 px-2 text-[11px] font-semibold text-right">{tx.price.toLocaleString()}</td>
+                              <td className="py-2 px-2 text-[11px] text-[#64748b] text-right">{tx.psf ?? '—'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    {!showAll && (
+                      <div className="mt-4 rounded-lg p-4 text-center border" style={{ background:'linear-gradient(135deg,rgba(59,130,246,.08),rgba(16,185,129,.06))', borderColor:'#3b82f6' }}>
+                        <div className="text-sm font-bold mb-1">🔓 Unlock Full Transaction History</div>
+                        <div className="text-[11px] text-[#94a3b8] mb-3">Upgrade to Pro to see all {building.totalTx} transactions with buyer nationality, unit number & export.</div>
+                        <button onClick={() => showToast('Stripe checkout coming soon!')}
+                          className="px-5 py-2 rounded-lg text-xs font-bold text-white" style={{ background:'#3b82f6' }}>
+                          Upgrade to Pro — $25/mo
+                        </button>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             )}
