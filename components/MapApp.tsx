@@ -141,12 +141,36 @@ function Chip({ label, active, color, onClick }: { label: string; active: boolea
   );
 }
 
+// ─── No-token warning ────────────────────────────────────────────────────────
+function NoTokenWarning() {
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center pointer-events-none">
+      <div className="rounded-xl border px-6 py-5 max-w-sm text-center pointer-events-auto"
+        style={{ background:'rgba(30,35,48,0.97)', borderColor:'#f59e0b', boxShadow:'0 0 0 1px rgba(245,158,11,0.2)' }}>
+        <div className="text-2xl mb-2">🗺️</div>
+        <div className="text-sm font-bold text-[#f59e0b] mb-1">Mapbox token not configured</div>
+        <div className="text-[11px] text-[#94a3b8] leading-relaxed mb-3">
+          Add your public Mapbox token to Vercel:<br />
+          <strong className="text-[#e2e8f0]">Settings → Environment Variables</strong><br />
+          <code className="text-[#10b981]">NEXT_PUBLIC_MAPBOX_TOKEN = pk.eyJ…</code>
+        </div>
+        <a href="https://account.mapbox.com" target="_blank" rel="noreferrer"
+          className="inline-block text-xs font-semibold px-4 py-2 rounded-lg"
+          style={{ background:'#f59e0b', color:'#0d0f14' }}>
+          Get free token → mapbox.com
+        </a>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function MapApp() {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef       = useRef<mapboxgl.Map | null>(null);
 
   const [plan,          setPlan]          = useState<Plan | null>(null);
+  const hasToken = Boolean(process.env.NEXT_PUBLIC_MAPBOX_TOKEN);
   const [building,      setBuilding]      = useState<Building | null>(null);
   const [transactions,  setTransactions]  = useState<Transaction[]>([]);
   const [activeTab,     setActiveTab]     = useState<ActiveTab>('overview');
@@ -417,6 +441,7 @@ export default function MapApp() {
   return (
     <div className="relative w-full h-screen overflow-hidden" style={{ background:'#0d0f14' }}>
       <div ref={mapContainer} className="absolute inset-0" />
+      {!hasToken && <NoTokenWarning />}
 
       {/* ── Header */}
       <header className="absolute top-0 left-0 right-0 z-40 flex items-center gap-3 px-4 border-b"
