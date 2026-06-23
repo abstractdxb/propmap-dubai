@@ -49,7 +49,7 @@ const CHART_OPTS = {
 const DEVELOPERS = Object.keys(DEVELOPER_COLORS).filter(d => d !== 'Other');
 const PROP_TYPES = ['apartment', 'villa', 'townhouse', 'office'];
 const TX_TYPES   = ['sale', 'rent', 'mortgage'];
-const AREAS      = [...new Set(BUILDINGS.map(b => b.community))].sort();
+const AREAS      = Array.from(new Set(BUILDINGS.map(b => b.community))).sort();
 
 // ─── Login ───────────────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }: { onLogin: (p: Plan) => void }) {
