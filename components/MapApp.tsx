@@ -395,6 +395,9 @@ export default function MapApp() {
     // First get area ID, then fetch transactions + rents in parallel
     const controller = new AbortController();
 
+    // Capture building into local const so TS knows it's non-null inside async closure
+    const b = building;
+
     async function fetchLiveData() {
       try {
         // 1. Resolve area ID from community name
@@ -405,7 +408,7 @@ export default function MapApp() {
         };
         const areas = areasJson?.data?.result ?? [];
         const match = areas.find(
-          a => a.AREA_EN?.toLowerCase() === building.community.toLowerCase()
+          a => a.AREA_EN?.toLowerCase() === b.community.toLowerCase()
         );
         const areaId = match?.AREA_ID ? String(match.AREA_ID) : '';
 

@@ -26,6 +26,13 @@ async function rateLimit(baseUrl: string): Promise<void> {
   lastCall[baseUrl] = Date.now();
 }
 
+/** Creates a fetch-compatible AbortSignal that fires after `ms` milliseconds. */
+function timeoutSignal(ms: number): AbortSignal {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), ms);
+  return controller.signal;
+}
+
 // ── DLD Gateway POST (transactions, rents, buildings, units, areas…)
 export async function dldPost<T = unknown>(
   command: string,
@@ -46,7 +53,7 @@ export async function dldPost<T = unknown>(
       'User-Agent':    'Mozilla/5.0 (compatible; PropMapDubai/1.0)',
     },
     body:   JSON.stringify(params),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: timeoutSignal(TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -75,7 +82,7 @@ export async function dldRentalIndex<T = unknown>(
       'Referer':    'https://dubailand.gov.ae/',
       'User-Agent': 'Mozilla/5.0 (compatible; PropMapDubai/1.0)',
     },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: timeoutSignal(TIMEOUT_MS),
   });
 
   if (!res.ok) throw new Error(`Rental index ${path} → HTTP ${res.status}`);
