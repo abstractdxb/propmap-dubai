@@ -8,10 +8,14 @@ import {
 } from 'chart.js';
 import { Line, Bar, Doughnut } from 'react-chartjs-2';
 import { DEVELOPER_COLORS, devColor } from '@/lib/data';
-import type { DLDTransaction, DLDRent } from '@/lib/server/dld-client';
+import type { NormalisedTransaction } from '@/lib/server/bayut-client';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement,
   BarElement, ArcElement, Filler, Tooltip, Legend);
+
+// Module-level cache: bayutQuery → Bayut externalID. Survives re-renders,
+// cleared on page refresh. Keeps API usage within free tier.
+const locationIdCache = new Map<string, string>();
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -20,13 +24,12 @@ type MapStyle = 'dark' | 'satellite' | 'streets';
 type ActiveTab = 'overview' | 'transactions' | 'trends';
 
 interface AreaFeature {
-  id:          string;
-  name:        string;
-  dldAreaId:   string;
-  dldAreaName: string;
-  lat:         number;
-  lng:         number;
-  hasDLD:      boolean;
+  id:         string;
+  name:       string;
+  bayutQuery: string;   // used to resolve externalID via /api/bayut/locate
+  locationId: string | null;  // Bayut externalID once resolved
+  lat:        number;
+  lng:        number;
 }
 
 interface Filters {
@@ -35,16 +38,12 @@ interface Filters {
   txTypes:   string[];
 }
 
-// GeoJSON types for our area features
 interface AreaGeoJSON {
   type: 'FeatureCollection';
   features: Array<{
     type: 'Feature';
     geometry: { type: 'Point'; coordinates: [number, number] };
-    properties: {
-      id: string; name: string;
-      dldAreaId: string; dldAreaName: string; hasDLD: boolean;
-    };
+    properties: { id: string; name: string; bayutQuery: string };
   }>;
 }
 
@@ -67,50 +66,36 @@ const CHART_OPTS = {
 };
 
 const PROP_TYPES = ['Apartment', 'Villa', 'Townhouse', 'Office'];
-const TX_TYPES   = ['Sales', 'Rentals', 'Mortgages'];
+const TX_TYPES   = ['Sales', 'Rentals'];
 const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-// ─── Chart helpers (computed from live DLD data) ──────────────────────────────
-
-function parseYearMonth(dateStr: string): string {
-  if (!dateStr) return '';
-  // DLD format: "DD/MM/YYYY ..." or "YYYY-MM-DD ..."
-  if (dateStr.match(/^\d{2}\/\d{2}\/\d{4}/)) {
-    const parts = dateStr.split('/');
-    return `${parts[2].slice(0, 4)}-${parts[1]}`;
-  }
-  return dateStr.slice(0, 7);
-}
+// ─── Chart helpers ────────────────────────────────────────────────────────────
 
 function ymLabel(ym: string): string {
   const [y, m] = ym.split('-');
   return `${MONTHS_SHORT[parseInt(m) - 1]} '${y?.slice(2)}`;
 }
 
-function computeStats(txs: DLDTransaction[]) {
-  const total = txs[0]?.TOTAL ?? txs.length;
-  const sales = txs.filter(t => !t.TRANSACTION_TYPE_EN?.toLowerCase().includes('rent') && t.AMOUNT > 0);
-  const withSize = sales.filter(t => t.PROPERTY_SIZE_SQM > 0);
-  const avgPsf = withSize.length
-    ? Math.round(withSize.reduce((s, t) => s + t.AMOUNT / (t.PROPERTY_SIZE_SQM * 10.764), 0) / withSize.length)
-    : 0;
+function computeStats(txs: NormalisedTransaction[], totalHits: number) {
+  const sales    = txs.filter(t => t.type === 'Sale' && t.priceFull > 0);
+  const withSize = sales.filter(t => t.areaSqft > 0);
+  const avgPsf   = withSize.length
+    ? Math.round(withSize.reduce((s, t) => s + t.psfAED, 0) / withSize.length) : 0;
   const avgPrice = sales.length
-    ? Math.round(sales.reduce((s, t) => s + t.AMOUNT, 0) / sales.length)
-    : 0;
-  const mostRecent = txs[0]?.INSTANCE_DATE?.slice(0, 10) ?? '—';
-  return { total, avgPsf, avgPrice, mostRecent };
+    ? Math.round(sales.reduce((s, t) => s + t.priceFull, 0) / sales.length) : 0;
+  const mostRecent = txs[0]?.date ?? '—';
+  return { total: totalHits, avgPsf, avgPrice, mostRecent };
 }
 
-function psfTrendChart(txs: DLDTransaction[]) {
+function psfTrendChart(txs: NormalisedTransaction[]) {
   const byMonth: Record<string, number[]> = {};
   txs.forEach(t => {
-    if (!t.AMOUNT || !t.PROPERTY_SIZE_SQM) return;
-    const ym = parseYearMonth(t.INSTANCE_DATE);
+    if (!t.psfAED || t.psfAED <= 0) return;
+    const ym = t.date.slice(0, 7);
     if (!ym) return;
-    const psf = t.AMOUNT / (t.PROPERTY_SIZE_SQM * 10.764);
-    if (psf > 50 && psf < 25000) {
+    if (t.psfAED > 50 && t.psfAED < 25000) {
       if (!byMonth[ym]) byMonth[ym] = [];
-      byMonth[ym].push(psf);
+      byMonth[ym].push(t.psfAED);
     }
   });
   const sorted = Object.keys(byMonth).sort().slice(-12);
@@ -125,16 +110,14 @@ function psfTrendChart(txs: DLDTransaction[]) {
   };
 }
 
-function volumeChart(txs: DLDTransaction[]) {
+function volumeChart(txs: NormalisedTransaction[]) {
   const sales: Record<string, number> = {};
   const rents: Record<string, number> = {};
   txs.forEach(t => {
-    const ym = parseYearMonth(t.INSTANCE_DATE);
+    const ym = t.date.slice(0, 7);
     if (!ym) return;
-    if (t.TRANSACTION_TYPE_EN?.toLowerCase().includes('rent'))
-      rents[ym] = (rents[ym] ?? 0) + 1;
-    else
-      sales[ym] = (sales[ym] ?? 0) + 1;
+    if (t.type === 'Rent') rents[ym] = (rents[ym] ?? 0) + 1;
+    else                   sales[ym] = (sales[ym] ?? 0) + 1;
   });
   const sorted = Array.from(new Set([...Object.keys(sales), ...Object.keys(rents)])).sort().slice(-12);
   return {
@@ -146,10 +129,10 @@ function volumeChart(txs: DLDTransaction[]) {
   };
 }
 
-function bedroomMixChart(txs: DLDTransaction[]) {
+function bedroomMixChart(txs: NormalisedTransaction[]) {
   const counts: Record<string, number> = {};
   txs.forEach(t => {
-    const r = (t.ROOMS_EN ?? '').toLowerCase();
+    const r = t.rooms.toLowerCase();
     const key = r.includes('studio') ? 'Studio'
       : r.includes('1') ? '1 BR'
       : r.includes('2') ? '2 BR'
@@ -170,16 +153,17 @@ function bedroomMixChart(txs: DLDTransaction[]) {
   };
 }
 
-function rentalByBedroomChart(rents: DLDRent[]) {
+function psfByBedroomChart(txs: NormalisedTransaction[]) {
   const byBed: Record<string, number[]> = {};
-  rents.forEach(r => {
-    if (!r.CONTRACT_AMOUNT || r.CONTRACT_AMOUNT <= 0) return;
-    const k = r.ROOMS_EN?.toLowerCase().includes('studio') ? 'Studio'
-      : r.ROOMS_EN?.includes('1') ? '1 BR'
-      : r.ROOMS_EN?.includes('2') ? '2 BR'
-      : r.ROOMS_EN?.includes('3') ? '3 BR'
+  txs.forEach(t => {
+    if (!t.psfAED || t.type !== 'Sale') return;
+    const r = t.rooms.toLowerCase();
+    const k = r.includes('studio') ? 'Studio'
+      : r.includes('1') ? '1 BR'
+      : r.includes('2') ? '2 BR'
+      : r.includes('3') ? '3 BR'
       : null;
-    if (k) { if (!byBed[k]) byBed[k] = []; byBed[k].push(r.CONTRACT_AMOUNT); }
+    if (k) { if (!byBed[k]) byBed[k] = []; byBed[k].push(t.psfAED); }
   });
   const order = ['Studio', '1 BR', '2 BR', '3 BR'];
   const labels = order.filter(l => byBed[l]?.length);
@@ -188,7 +172,7 @@ function rentalByBedroomChart(rents: DLDRent[]) {
     labels,
     datasets: [
       { label: 'Min',    data: labels.map(l => Math.min(...byBed[l])), backgroundColor: 'rgba(59,130,246,0.35)', borderRadius: 4 },
-      { label: 'Median', data: labels.map(l => avg(byBed[l])),         backgroundColor: 'rgba(59,130,246,0.85)', borderRadius: 4 },
+      { label: 'Avg',    data: labels.map(l => avg(byBed[l])),         backgroundColor: 'rgba(59,130,246,0.85)', borderRadius: 4 },
       { label: 'Max',    data: labels.map(l => Math.max(...byBed[l])), backgroundColor: 'rgba(59,130,246,0.2)',  borderRadius: 4 },
     ],
   };
@@ -210,8 +194,8 @@ function LoginScreen({ onLogin }: { onLogin: (p: Plan) => void }) {
             </div>
             <div className="mt-7 space-y-4">
               {[
-                ['🏙️','55 Real Dubai Communities','Area markers sourced from DLD open-data registry'],
-                ['📊','Live DLD Transaction Data','Every registered sale, rental & mortgage — real-time'],
+                ['🏙️','55 Real Dubai Communities','Area markers spanning all major DLD-registered neighbourhoods'],
+                ['📊','Live Transaction Data','DLD-registered sales & rentals via Bayut — updated daily'],
                 ['🗺️','Interactive Mapbox Map','3D buildings, area heatmap, click-to-drill community detail'],
                 ['🔍','Filter by Area, Type & Transaction','Narrow to the area and transaction type you care about'],
               ].map(([icon, title, desc]) => (
@@ -316,29 +300,27 @@ function StatCard({ label, value, sub, subColor }: { label: string; value: strin
   );
 }
 
-// ─── Map layer setup (called on initial load and after style change) ──────────
+// ─── Map layer setup ──────────────────────────────────────────────────────────
 
 function setupLayers(map: mapboxgl.Map, geojson: AreaGeoJSON | null) {
-  // 3D buildings from Mapbox tiles
   if (!map.getLayer('3d-buildings') && map.getStyle()?.name !== 'Streets') {
     try {
       map.addLayer({ id:'3d-buildings', source:'composite', 'source-layer':'building', filter:['==','extrude','true'], type:'fill-extrusion', minzoom:13, paint:{'fill-extrusion-color':'#1e2330','fill-extrusion-height':['get','height'],'fill-extrusion-base':['get','min_height'],'fill-extrusion-opacity':0.65} });
-    } catch { /* layer already exists or source not available */ }
+    } catch { /* ignore */ }
   }
 
   const emptyFC: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
 
-  // Areas source
   if (!map.getSource('areas')) {
     map.addSource('areas', { type: 'geojson', data: (geojson as unknown as GeoJSON.FeatureCollection) ?? emptyFC });
     map.addLayer({
       id: 'area-points', type: 'circle', source: 'areas',
       paint: {
-        'circle-color': ['case', ['get','hasDLD'], '#3b82f6', '#475569'],
+        'circle-color': '#3b82f6',
         'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 5, 12, 8, 15, 12],
         'circle-stroke-width': 2,
-        'circle-stroke-color': ['case', ['get','hasDLD'], 'rgba(255,255,255,0.5)', 'rgba(255,255,255,0.15)'],
-        'circle-opacity': ['case', ['get','hasDLD'], 0.9, 0.45],
+        'circle-stroke-color': 'rgba(255,255,255,0.5)',
+        'circle-opacity': 0.9,
       },
     });
     map.addLayer({
@@ -360,7 +342,6 @@ function setupLayers(map: mapboxgl.Map, geojson: AreaGeoJSON | null) {
     });
   }
 
-  // Heatmap source
   if (!map.getSource('heatmap-data')) {
     map.addSource('heatmap-data', { type: 'geojson', data: emptyFC });
     map.addLayer({
@@ -384,7 +365,6 @@ function setupLayers(map: mapboxgl.Map, geojson: AreaGeoJSON | null) {
 export default function MapApp() {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef       = useRef<mapboxgl.Map | null>(null);
-  // Keep ref for stale-closure-safe access in callbacks
   const areasGeoJSONRef = useRef<AreaGeoJSON | null>(null);
 
   const [plan,          setPlan]          = useState<Plan | null>(null);
@@ -393,8 +373,8 @@ export default function MapApp() {
   const [areaNames,     setAreaNames]     = useState<string[]>([]);
   const [areasLoading,  setAreasLoading]  = useState(false);
   const [selectedArea,  setSelectedArea]  = useState<AreaFeature | null>(null);
-  const [liveTx,        setLiveTx]        = useState<DLDTransaction[] | null>(null);
-  const [liveRents,     setLiveRents]     = useState<DLDRent[] | null>(null);
+  const [liveTx,        setLiveTx]        = useState<NormalisedTransaction[] | null>(null);
+  const [txTotal,       setTxTotal]       = useState<number>(0);
   const [txLoading,     setTxLoading]     = useState(false);
   const [dataSource,    setDataSource]    = useState<'live' | 'none' | null>(null);
   const hasToken = Boolean(process.env.NEXT_PUBLIC_MAPBOX_TOKEN);
@@ -414,7 +394,7 @@ export default function MapApp() {
     return arr.includes(val) ? arr.filter(v => v !== val) : [...arr, val];
   }
 
-  // ── Load area GeoJSON from API
+  // ── Load area GeoJSON
   useEffect(() => {
     if (!plan) return;
     setAreasLoading(true);
@@ -447,29 +427,24 @@ export default function MapApp() {
     map.on('load', () => {
       setupLayers(map, areasGeoJSONRef.current);
 
-      // Click → open area panel (map-level so it survives style changes)
       map.on('click', (e) => {
         if (!map.getLayer('area-points')) return;
         const features = map.queryRenderedFeatures(e.point, { layers: ['area-points'] });
         if (!features.length) return;
-        const p = features[0].properties as {
-          id: string; name: string;
-          dldAreaId: string; dldAreaName: string; hasDLD: boolean;
-        };
+        const p = features[0].properties as { id: string; name: string; bayutQuery: string };
         const geo = features[0].geometry as GeoJSON.Point;
         setSelectedArea({
-          id: p.id, name: p.name,
-          dldAreaId: p.dldAreaId ?? '',
-          dldAreaName: p.dldAreaName ?? '',
-          lat: geo.coordinates[1],
-          lng: geo.coordinates[0],
-          hasDLD: Boolean(p.hasDLD),
+          id:         p.id,
+          name:       p.name,
+          bayutQuery: p.bayutQuery ?? p.name,
+          locationId: locationIdCache.get(p.bayutQuery ?? p.name) ?? null,
+          lat:        geo.coordinates[1],
+          lng:        geo.coordinates[0],
         });
         setActiveTab('overview');
         map.flyTo({ center: [geo.coordinates[0], geo.coordinates[1]], zoom: Math.max(map.getZoom(), 13), pitch: 60, speed: 0.9 });
       });
 
-      // Cursor on hover (map-level, survives style changes)
       map.on('mousemove', (e) => {
         if (!map.getLayer('area-points')) return;
         const features = map.queryRenderedFeatures(e.point, { layers: ['area-points'] });
@@ -485,16 +460,12 @@ export default function MapApp() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plan]);
 
-  // ── Push area GeoJSON into map when both are ready
+  // ── Push area GeoJSON into map
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !areasGeoJSON || !mapReady) return;
-
     const src = map.getSource('areas') as mapboxgl.GeoJSONSource | undefined;
-    if (src) {
-      src.setData(areasGeoJSON as unknown as GeoJSON.FeatureCollection);
-    }
-    // Heatmap: area centroid dots, equal weight
+    if (src) src.setData(areasGeoJSON as unknown as GeoJSON.FeatureCollection);
     const heatSrc = map.getSource('heatmap-data') as mapboxgl.GeoJSONSource | undefined;
     if (heatSrc) {
       heatSrc.setData({
@@ -522,56 +493,64 @@ export default function MapApp() {
     }
   }, [filters.areas, mapReady]);
 
-  // ── Fetch DLD data when area selected
+  // ── Fetch Bayut data when area selected
   useEffect(() => {
     if (!selectedArea) return;
 
     setLiveTx(null);
-    setLiveRents(null);
+    setTxTotal(0);
     setDataSource(null);
-
-    if (!selectedArea.hasDLD || !selectedArea.dldAreaId) {
-      setDataSource('none');
-      setTxLoading(false);
-      return;
-    }
-
     setTxLoading(true);
-    const to   = new Date();
-    const from = new Date();
-    from.setFullYear(from.getFullYear() - 2);
-    const fmt  = (d: Date) =>
-      `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
 
     const controller = new AbortController();
-    const a = selectedArea;
+    const { signal } = controller;
 
     async function fetchData() {
       try {
-        const txP   = new URLSearchParams({ from: fmt(from), to: fmt(to), areaId: a.dldAreaId, take: '50', skip: '0' });
-        const rentP = new URLSearchParams({ from: fmt(from), to: fmt(to), areaId: a.dldAreaId, take: '30', skip: '0' });
+        // Step 1: resolve community name → Bayut externalID (cached per session)
+        let locationId = locationIdCache.get(selectedArea!.bayutQuery) ?? null;
+        if (!locationId) {
+          const locRes = await fetch(
+            `/api/bayut/locate?query=${encodeURIComponent(selectedArea!.bayutQuery)}`,
+            { signal }
+          );
+          if (locRes.ok) {
+            const loc = await locRes.json() as { externalID?: string };
+            if (loc.externalID) {
+              locationId = loc.externalID;
+              locationIdCache.set(selectedArea!.bayutQuery, locationId);
+            }
+          }
+        }
 
-        const [txRes, rentRes] = await Promise.all([
-          fetch(`/api/dld/transactions?${txP}`, { signal: controller.signal }),
-          fetch(`/api/dld/rents?${rentP}`,      { signal: controller.signal }),
-        ]);
-
-        if (txRes.ok) {
-          const j = await txRes.json() as { data: { result: DLDTransaction[] } };
-          const rows = j?.data?.result ?? [];
-          setLiveTx(rows.length ? rows : null);
-          setDataSource(rows.length ? 'live' : 'none');
-        } else {
+        if (!locationId) {
           setDataSource('none');
+          setTxLoading(false);
+          return;
         }
 
-        if (rentRes.ok) {
-          const j = await rentRes.json() as { data: { result: DLDRent[] } };
-          setLiveRents(j?.data?.result ?? []);
-        }
+        // Step 2: fetch transactions for this location
+        const txParams = new URLSearchParams({
+          purpose:    'for-sale',
+          locationIds: locationId,
+          timePeriod: '12m',
+          sortBy:     'date_desc',
+          page:       '1',
+        });
+        const txRes = await fetch(`/api/dld/transactions?${txParams}`, { signal });
+        if (!txRes.ok) throw new Error(`Transactions HTTP ${txRes.status}`);
+        const txData = await txRes.json() as {
+          transactions: NormalisedTransaction[];
+          total: number;
+        };
+
+        const rows = txData.transactions ?? [];
+        setLiveTx(rows.length ? rows : null);
+        setTxTotal(txData.total ?? rows.length);
+        setDataSource(rows.length ? 'live' : 'none');
       } catch (e: unknown) {
         if ((e as Error).name !== 'AbortError') {
-          console.warn('[PropMap] DLD fetch error', e);
+          console.warn('[PropMap] BayutAPI fetch error', e);
           setDataSource('none');
         }
       } finally {
@@ -581,6 +560,7 @@ export default function MapApp() {
 
     fetchData();
     return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedArea]);
 
   // ── Map style change
@@ -591,11 +571,9 @@ export default function MapApp() {
     setMapStyle(s);
     map.once('style.load', () => {
       setupLayers(map, areasGeoJSONRef.current);
-      // Restore heatmap visibility if it was on
       if (heatmap && map.getLayer('price-heatmap')) {
         map.setLayoutProperty('price-heatmap', 'visibility', 'visible');
       }
-      // Re-push GeoJSON data
       if (areasGeoJSONRef.current) {
         const src = map.getSource('areas') as mapboxgl.GeoJSONSource | undefined;
         src?.setData(areasGeoJSONRef.current as unknown as GeoJSON.FeatureCollection);
@@ -621,33 +599,25 @@ export default function MapApp() {
   const closePanel = () => {
     setSelectedArea(null);
     setLiveTx(null);
-    setLiveRents(null);
+    setTxTotal(0);
     mapRef.current?.flyTo({ center:[55.2708,25.2048], zoom:11, pitch:45, speed:0.7 });
   };
 
-  const isAdmin  = plan === 'admin';
-  const showAll  = isAdmin || plan === 'pro';
-  const txLimit  = showAll ? 50 : 10;
+  const isAdmin = plan === 'admin';
+  const showAll = isAdmin || plan === 'pro';
+  const txLimit = showAll ? 50 : 10;
 
-  // Computed chart data — only when we have live transactions
-  const stats    = liveTx?.length ? computeStats(liveTx)        : null;
-  const psfChart = liveTx?.length ? psfTrendChart(liveTx)       : null;
-  const volChart = liveTx?.length ? volumeChart(liveTx)         : null;
-  const bedChart = liveTx?.length ? bedroomMixChart(liveTx)     : null;
-  const rentChart = liveRents?.length ? rentalByBedroomChart(liveRents) : null;
+  const stats    = liveTx?.length ? computeStats(liveTx, txTotal)  : null;
+  const psfChart = liveTx?.length ? psfTrendChart(liveTx)          : null;
+  const volChart = liveTx?.length ? volumeChart(liveTx)            : null;
+  const bedChart = liveTx?.length ? bedroomMixChart(liveTx)        : null;
+  const psfBed   = liveTx?.length ? psfByBedroomChart(liveTx)      : null;
 
-  // Filter transactions for display
   const displayTx = liveTx?.filter(t => {
-    if (filters.txTypes.length) {
-      const type = t.TRANSACTION_TYPE_EN?.toLowerCase() ?? '';
-      const isRent = type.includes('rent');
-      const isMort = type.includes('mort') || type.includes('financ');
-      if (filters.txTypes.includes('Sales')     && !isRent && !isMort) return true;
-      if (filters.txTypes.includes('Rentals')   && isRent)             return true;
-      if (filters.txTypes.includes('Mortgages') && isMort)             return true;
-      return false;
-    }
-    return true;
+    if (!filters.txTypes.length) return true;
+    if (filters.txTypes.includes('Sales')   && t.type === 'Sale') return true;
+    if (filters.txTypes.includes('Rentals') && t.type === 'Rent') return true;
+    return false;
   }) ?? null;
 
   if (!plan) return <LoginScreen onLogin={setPlan} />;
@@ -698,7 +668,6 @@ export default function MapApp() {
       <aside className="absolute z-30 overflow-y-auto border-r transition-transform duration-300"
         style={{ top:56, left:0, bottom:0, width:272, background:'rgba(13,15,20,0.93)', backdropFilter:'blur(12px)', borderColor:'#2a3040', transform: sidebarOpen ? 'translateX(0)' : 'translateX(-100%)' }}>
 
-        {/* Community filter */}
         <div className="p-4 border-b" style={{ borderColor:'#2a3040' }}>
           <div className="flex items-center justify-between mb-3">
             <span className="text-[10px] font-bold uppercase tracking-widest text-[#64748b]">Community / Area</span>
@@ -717,7 +686,6 @@ export default function MapApp() {
           )}
         </div>
 
-        {/* Property Type */}
         <div className="p-4 border-b" style={{ borderColor:'#2a3040' }}>
           <div className="flex items-center justify-between mb-3">
             <span className="text-[10px] font-bold uppercase tracking-widest text-[#64748b]">Property Type</span>
@@ -733,7 +701,6 @@ export default function MapApp() {
           </div>
         </div>
 
-        {/* Transaction Type */}
         <div className="p-4 border-b" style={{ borderColor:'#2a3040' }}>
           <div className="flex items-center justify-between mb-3">
             <span className="text-[10px] font-bold uppercase tracking-widest text-[#64748b]">Transaction</span>
@@ -743,14 +710,13 @@ export default function MapApp() {
           <div className="flex flex-wrap gap-1.5">
             {TX_TYPES.map(t => (
               <Chip key={t} label={t}
-                color={t==='Sales'?'#3b82f6':t==='Rentals'?'#10b981':'#f59e0b'}
+                color={t==='Sales'?'#3b82f6':'#10b981'}
                 active={filters.txTypes.includes(t)}
                 onClick={() => setFilters(f=>({...f,txTypes:toggle(f.txTypes,t)}))} />
             ))}
           </div>
         </div>
 
-        {/* Reset all */}
         {(filters.areas.length||filters.propTypes.length||filters.txTypes.length) ? (
           <div className="p-4">
             <button onClick={() => setFilters(EMPTY_FILTERS)}
@@ -761,26 +727,17 @@ export default function MapApp() {
           </div>
         ) : null}
 
-        {/* DLD data indicator */}
         <div className="p-4 border-t" style={{ borderColor:'#2a3040' }}>
-          <div className="text-[10px] font-bold uppercase tracking-widest text-[#64748b] mb-3">Data Sources</div>
-          <div className="space-y-2">
-            {[
-              { dot:'#3b82f6', label:'DLD data available', sub:'Click area for live transactions' },
-              { dot:'#475569', label:'Area mapped (no DLD match)', sub:'Coordinate data only' },
-            ].map(({ dot, label, sub }) => (
-              <div key={label} className="flex items-start gap-2">
-                <div className="w-2.5 h-2.5 rounded-full flex-shrink-0 mt-0.5" style={{ background:dot }} />
-                <div>
-                  <div className="text-[11px] text-[#94a3b8]">{label}</div>
-                  <div className="text-[10px] text-[#64748b]">{sub}</div>
-                </div>
-              </div>
-            ))}
+          <div className="text-[10px] font-bold uppercase tracking-widest text-[#64748b] mb-3">Data Source</div>
+          <div className="flex items-start gap-2">
+            <div className="w-2.5 h-2.5 rounded-full flex-shrink-0 mt-0.5" style={{ background:'#3b82f6' }} />
+            <div>
+              <div className="text-[11px] text-[#94a3b8]">Bayut / DLD verified</div>
+              <div className="text-[10px] text-[#64748b]">Click any area for live transaction data</div>
+            </div>
           </div>
         </div>
 
-        {/* Developer legend */}
         <div className="p-4 border-t" style={{ borderColor:'#2a3040' }}>
           <div className="text-[10px] font-bold uppercase tracking-widest text-[#64748b] mb-3">Major Developers</div>
           <div className="space-y-1.5">
@@ -799,25 +756,21 @@ export default function MapApp() {
         style={{ width:400, background:'rgba(13,15,20,0.96)', backdropFilter:'blur(16px)', borderColor:'#2a3040', transform: selectedArea ? 'translateX(0)' : 'translateX(100%)' }}>
         {selectedArea && (
           <>
-            {/* Panel header */}
             <div className="sticky top-0 z-10 p-4 border-b flex items-start justify-between"
               style={{ background:'rgba(13,15,20,0.98)', backdropFilter:'blur(12px)', borderColor:'#2a3040' }}>
               <div>
                 <div className="flex items-center gap-2 mb-1">
-                  <div className="w-2 h-2 rounded-full" style={{ background: selectedArea.hasDLD ? '#10b981' : '#475569' }} />
-                  <span className="text-[11px] font-semibold" style={{ color: selectedArea.hasDLD ? '#10b981' : '#64748b' }}>
-                    {selectedArea.hasDLD ? '✓ DLD Live Data' : 'No DLD Match'}
-                  </span>
+                  <div className="w-2 h-2 rounded-full" style={{ background: '#10b981' }} />
+                  <span className="text-[11px] font-semibold text-[#10b981]">Bayut Live Data</span>
                 </div>
                 <div className="text-base font-bold leading-tight">{selectedArea.name}</div>
-                <div className="text-[11px] text-[#64748b] mt-1">Dubai · {selectedArea.dldAreaName}</div>
+                <div className="text-[11px] text-[#64748b] mt-1">Dubai · DLD-registered transactions</div>
               </div>
               <button onClick={closePanel}
                 className="w-7 h-7 rounded-md flex items-center justify-center text-xs border flex-shrink-0 ml-3"
                 style={{ background:'#1e2330', borderColor:'#2a3040', color:'#94a3b8' }}>✕</button>
             </div>
 
-            {/* Tabs */}
             <div className="flex border-b" style={{ borderColor:'#2a3040' }}>
               {(['overview','transactions','trends'] as ActiveTab[]).map(tab => (
                 <button key={tab} onClick={() => setActiveTab(tab)}
@@ -834,14 +787,14 @@ export default function MapApp() {
                 {txLoading ? (
                   <div className="flex flex-col items-center justify-center py-12 gap-3">
                     <span className="w-5 h-5 rounded-full border-2 border-t-transparent border-[#3b82f6] animate-spin" />
-                    <span className="text-[12px] text-[#64748b]">Fetching DLD transactions…</span>
+                    <span className="text-[12px] text-[#64748b]">Fetching transactions from Bayut…</span>
                   </div>
                 ) : stats ? (
                   <>
                     <div className="grid grid-cols-2 gap-2.5">
                       <StatCard label="Avg Sale PSF"       value={`AED ${stats.avgPsf.toLocaleString()}`}    sub="Per sq ft (sales)" />
                       <StatCard label="Avg Transaction"    value={`AED ${(stats.avgPrice/1e6).toFixed(2)}M`} sub="Sales only" />
-                      <StatCard label="Total DLD Records"  value={stats.total.toLocaleString()}              sub="Last 2 years" />
+                      <StatCard label="Total DLD Records"  value={stats.total.toLocaleString()}              sub="Last 12 months" />
                       <StatCard label="Most Recent"        value={stats.mostRecent}                          sub="Registered date" />
                     </div>
                     {psfChart && psfChart.labels.length > 1 && (
@@ -861,14 +814,14 @@ export default function MapApp() {
                       </div>
                     )}
                     <div className="rounded-lg p-3 border text-center" style={{ background:'rgba(59,130,246,.05)', borderColor:'rgba(59,130,246,.2)', borderStyle:'dashed' }}>
-                      <div className="text-[11px] text-[#64748b]">Showing 50 most recent transactions from DLD registry</div>
+                      <div className="text-[11px] text-[#64748b]">Showing most recent transactions from DLD registry via Bayut</div>
                     </div>
                   </>
                 ) : dataSource === 'none' ? (
                   <div className="rounded-lg p-6 border text-center" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
                     <div className="text-2xl mb-2">📭</div>
-                    <div className="text-sm font-semibold mb-1">No DLD data available</div>
-                    <div className="text-[11px] text-[#64748b]">This area hasn't been matched to a DLD area ID yet, or returned no transactions in the last 2 years.</div>
+                    <div className="text-sm font-semibold mb-1">No data available</div>
+                    <div className="text-[11px] text-[#64748b]">This community returned no transactions in the last 12 months, or could not be resolved to a Bayut location.</div>
                   </div>
                 ) : null}
               </div>
@@ -882,17 +835,17 @@ export default function MapApp() {
                     {txLoading ? (
                       <span className="text-[11px] text-[#64748b] flex items-center gap-1.5">
                         <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-t-transparent border-[#3b82f6] animate-spin" />
-                        Fetching DLD data…
+                        Fetching data…
                       </span>
                     ) : (
                       <>
                         <span className="text-[11px] text-[#64748b]">
-                          {displayTx ? `${Math.min(displayTx.length, txLimit)} of ${liveTx?.[0]?.TOTAL ?? liveTx?.length ?? 0} records` : '—'}
+                          {displayTx ? `${Math.min(displayTx.length, txLimit)} of ${txTotal.toLocaleString()} records` : '—'}
                         </span>
                         {dataSource && (
                           <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded"
                             style={{ background: dataSource==='live' ? 'rgba(16,185,129,.15)' : 'rgba(100,116,139,.15)', color: dataSource==='live' ? '#10b981' : '#64748b' }}>
-                            {dataSource === 'live' ? '✓ DLD Live' : '⚠ No Data'}
+                            {dataSource === 'live' ? '✓ Bayut Live' : '⚠ No Data'}
                           </span>
                         )}
                       </>
@@ -905,7 +858,7 @@ export default function MapApp() {
                     <table className="w-full border-collapse">
                       <thead>
                         <tr style={{ borderBottom:'1px solid #2a3040' }}>
-                          {['Date','Type','Beds','Size (sqm)','Amount (AED)'].map(h=>(
+                          {['Date','Type','Beds','Size (sqft)','AED'].map(h=>(
                             <th key={h} className="text-left py-2 px-1.5 text-[10px] font-bold uppercase tracking-wide text-[#64748b]">{h}</th>
                           ))}
                         </tr>
@@ -913,25 +866,24 @@ export default function MapApp() {
                       <tbody>
                         {displayTx.slice(0, txLimit).map((tx, i) => {
                           const blurred = !showAll && i >= 10;
-                          const typeLow = tx.TRANSACTION_TYPE_EN?.toLowerCase() ?? '';
-                          const type    = typeLow.includes('rent') ? 'rent' : typeLow.includes('mort') || typeLow.includes('financ') ? 'mortgage' : 'sale';
+                          const type    = tx.type.toLowerCase();
                           const typeColors: Record<string,{bg:string;text:string}> = {
-                            sale:     { bg:'rgba(59,130,246,.15)',  text:'#3b82f6' },
-                            rent:     { bg:'rgba(16,185,129,.15)',  text:'#10b981' },
-                            mortgage: { bg:'rgba(245,158,11,.15)',  text:'#f59e0b' },
+                            sale: { bg:'rgba(59,130,246,.15)',  text:'#3b82f6' },
+                            rent: { bg:'rgba(16,185,129,.15)',  text:'#10b981' },
                           };
+                          const tc = typeColors[type] ?? typeColors.sale;
                           return (
-                            <tr key={i} style={{ opacity:blurred?.3:1, filter:blurred?'blur(4px)':'none', userSelect:blurred?'none':'auto', borderBottom:'1px solid rgba(42,48,64,.4)' }}>
-                              <td className="py-2 px-1.5 text-[11px] text-[#94a3b8]">{tx.INSTANCE_DATE?.split(' ')[0]}</td>
+                            <tr key={tx.id ?? i} style={{ opacity:blurred?.3:1, filter:blurred?'blur(4px)':'none', userSelect:blurred?'none':'auto', borderBottom:'1px solid rgba(42,48,64,.4)' }}>
+                              <td className="py-2 px-1.5 text-[11px] text-[#94a3b8]">{tx.date}</td>
                               <td className="py-2 px-1.5">
                                 <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
-                                  style={{ background:typeColors[type].bg, color:typeColors[type].text }}>
-                                  {tx.TRANSACTION_TYPE_EN?.slice(0,4) ?? type}
+                                  style={{ background:tc.bg, color:tc.text }}>
+                                  {tx.type}
                                 </span>
                               </td>
-                              <td className="py-2 px-1.5 text-[11px]">{tx.ROOMS_EN ?? '—'}</td>
-                              <td className="py-2 px-1.5 text-[11px] text-right">{tx.PROPERTY_SIZE_SQM ? Math.round(tx.PROPERTY_SIZE_SQM).toLocaleString() : '—'}</td>
-                              <td className="py-2 px-1.5 text-[11px] font-semibold text-right">{tx.AMOUNT ? tx.AMOUNT.toLocaleString() : '—'}</td>
+                              <td className="py-2 px-1.5 text-[11px]">{tx.rooms ?? '—'}</td>
+                              <td className="py-2 px-1.5 text-[11px] text-right">{tx.areaSqft ? Math.round(tx.areaSqft).toLocaleString() : '—'}</td>
+                              <td className="py-2 px-1.5 text-[11px] font-semibold text-right">{tx.priceFull ? tx.priceFull.toLocaleString() : '—'}</td>
                             </tr>
                           );
                         })}
@@ -940,7 +892,7 @@ export default function MapApp() {
                     {!showAll && displayTx.length > 10 && (
                       <div className="mt-4 rounded-lg p-4 text-center border" style={{ background:'linear-gradient(135deg,rgba(59,130,246,.08),rgba(16,185,129,.06))', borderColor:'#3b82f6' }}>
                         <div className="text-sm font-bold mb-1">🔓 Unlock Full Transaction History</div>
-                        <div className="text-[11px] text-[#94a3b8] mb-3">See all {liveTx?.[0]?.TOTAL ?? displayTx.length} DLD-verified transactions with buyer nationality, unit number & CSV export.</div>
+                        <div className="text-[11px] text-[#94a3b8] mb-3">See all {txTotal.toLocaleString()} DLD-verified transactions with CSV export.</div>
                         <button onClick={() => showToast('Stripe checkout coming soon!')}
                           className="px-5 py-2 rounded-lg text-xs font-bold text-white" style={{ background:'#3b82f6' }}>
                           Upgrade to Pro — $25/mo
@@ -963,20 +915,20 @@ export default function MapApp() {
                 {txLoading ? (
                   <div className="flex flex-col items-center justify-center py-12 gap-3">
                     <span className="w-5 h-5 rounded-full border-2 border-t-transparent border-[#3b82f6] animate-spin" />
-                    <span className="text-[12px] text-[#64748b]">Loading DLD data…</span>
+                    <span className="text-[12px] text-[#64748b]">Loading data…</span>
                   </div>
                 ) : (
                   <>
-                    {rentChart && rentChart.labels.length > 0 ? (
+                    {psfBed && psfBed.labels.length > 0 ? (
                       <div className="rounded-lg p-4 border" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
-                        <div className="text-xs font-semibold text-[#94a3b8] mb-3">Annual Rental by Bedroom (AED) — DLD Contracts</div>
+                        <div className="text-xs font-semibold text-[#94a3b8] mb-3">AED/sqft by Bedroom — Sales</div>
                         <div style={{ height:180 }}>
-                          <Bar data={rentChart} options={{ ...CHART_OPTS, plugins:{legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:10},boxWidth:8}}}, scales:{ x:{ticks:{color:'#64748b',font:{size:10}},grid:{display:false}}, y:{ticks:{color:'#64748b',font:{size:10},callback:(v)=>'AED '+(Number(v)/1000)+'K'},grid:{color:'rgba(42,48,64,.5)'}} } }} />
+                          <Bar data={psfBed} options={{ ...CHART_OPTS, plugins:{legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:10},boxWidth:8}}}, scales:{ x:{ticks:{color:'#64748b',font:{size:10}},grid:{display:false}}, y:{ticks:{color:'#64748b',font:{size:10},callback:(v)=>'AED '+Number(v).toLocaleString()},grid:{color:'rgba(42,48,64,.5)'}} } }} />
                         </div>
                       </div>
-                    ) : liveRents !== null && (
+                    ) : liveTx !== null && (
                       <div className="rounded-lg p-4 border text-center" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
-                        <div className="text-[12px] text-[#64748b]">No rental contract data for this area.</div>
+                        <div className="text-[12px] text-[#64748b]">Insufficient PSF data for this area.</div>
                       </div>
                     )}
 
@@ -996,7 +948,7 @@ export default function MapApp() {
                     {!liveTx && !txLoading && (
                       <div className="rounded-lg p-6 border text-center" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
                         <div className="text-2xl mb-2">📭</div>
-                        <div className="text-sm text-[#64748b]">No DLD data available for trend analysis.</div>
+                        <div className="text-sm text-[#64748b]">No data available for trend analysis.</div>
                       </div>
                     )}
                   </>
@@ -1033,7 +985,7 @@ export default function MapApp() {
       {/* ── Legend */}
       <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 flex gap-4 items-center rounded-full px-4 py-2 border"
         style={{ background:'rgba(13,15,20,0.9)', backdropFilter:'blur(8px)', borderColor:'#2a3040' }}>
-        {[['#3b82f6','DLD data available'],['#475569','No DLD match'],['rgba(239,68,68,0.7)','Heatmap intensity']].map(([c,l])=>(
+        {[['#3b82f6','DLD-registered area'],['rgba(239,68,68,0.7)','Heatmap intensity']].map(([c,l])=>(
           <div key={l} className="flex items-center gap-1.5 text-[11px] text-[#94a3b8]">
             <div className="w-2 h-2 rounded-full" style={{ background:c }} />{l}
           </div>

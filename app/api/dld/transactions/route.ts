@@ -1,3 +1,22 @@
+/**
+ * GET /api/dld/transactions
+ *
+ * Proxies to BayutAPI (RapidAPI) instead of the DLD gateway, which is WAF-blocked
+ * for all Vercel server-side IPs.
+ *
+ * Query params accepted:
+ *   purpose      'for-sale' | 'for-rent'  (default: 'for-sale')
+ *   locationIds  comma-separated Bayut externalIDs  (e.g. '5003')
+ *   timePeriod   '1m' | '3m' | '6m' | '12m' | '24m'  (default: '12m')
+ *   category     'apartments' | 'villas' | 'townhouses' | 'commercial' | ...
+ *   status       'completed' | 'under-construction' | 'any'
+ *   beds         comma-separated bedroom counts (0 = studio)
+ *   priceMin     number
+ *   priceMax     number
+ *   sortBy       'date_desc' | 'date_asc' | 'price_desc' | 'price_asc'
+ *   page         number  (default: 1)
+ */
+
 import { NextRequest, NextResponse } from 'next/server';
 import {
   bayutTransactions,

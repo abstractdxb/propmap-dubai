@@ -28,13 +28,21 @@ export async function GET() {
     autocompleteError = String(e);
   }
 
+<<<<<<< HEAD
   // 2. Transactions test — fetch recent sales in Dubai Marina (externalID 5003)
+=======
+  // 2. Transactions test — fetch 2 recent sales in Dubai Marina (externalID 5003)
+>>>>>>> 0c4618c (feat: replace DLD gateway with BayutAPI)
   let txResult: unknown = null;
   let txError:  string | null = null;
   try {
     const data = await bayutTransactions({
       purpose:     'for-sale',
+<<<<<<< HEAD
       locationIds: '5003',
+=======
+      locationIds: '5003',     // Dubai Marina
+>>>>>>> 0c4618c (feat: replace DLD gateway with BayutAPI)
       timePeriod:  '3m',
       page:        1,
     });
