@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { dldPost, DLDTransaction, DLDResponse } from '@/lib/server/dld-client';
+import {
+  bayutTransactions,
+  normaliseBayutTx,
+  BayutTransactionsParams,
+} from '@/lib/server/bayut-client';
 import { getCached, setCached, cacheKey, TTL } from '@/lib/server/dld-cache';
 
 export const runtime = 'nodejs';
@@ -7,38 +11,44 @@ export const runtime = 'nodejs';
 export async function GET(req: NextRequest) {
   const s = req.nextUrl.searchParams;
 
-  // Only include non-empty params — DLD gateway 500s on unexpected keys
-  const params: Record<string, string> = {};
-  const set = (k: string, v: string | null, def?: string) => {
-    const val = v ?? def ?? '';
-    if (val) params[k] = val;
+  const purpose = (s.get('purpose') ?? 'for-sale') as 'for-sale' | 'for-rent';
+  const page    = Number(s.get('page') ?? '1');
+
+  const params: BayutTransactionsParams = {
+    purpose,
+    page,
+    locationIds:      s.get('locationIds')  ?? undefined,
+    timePeriod:       (s.get('timePeriod')  as BayutTransactionsParams['timePeriod']) ?? '12m',
+    categoryIds:      s.get('category')     ?? undefined,
+    completionStatus: (s.get('status')      as BayutTransactionsParams['completionStatus']) ?? undefined,
+    beds:             s.get('beds')         ?? undefined,
+    priceMin:         s.get('priceMin')     ? Number(s.get('priceMin'))  : undefined,
+    priceMax:         s.get('priceMax')     ? Number(s.get('priceMax'))  : undefined,
+    sortBy:           (s.get('sortBy')      as BayutTransactionsParams['sortBy'])      ?? 'date_desc',
   };
 
-  set('P_FROM_DATE',    s.get('from'));
-  set('P_TO_DATE',      s.get('to'));
-  set('P_GROUP_ID',     s.get('type'));
-  set('P_IS_OFFPLAN',   s.get('offplan'));
-  set('P_IS_FREE_HOLD', s.get('freehold'));
-  set('P_AREA_ID',      s.get('areaId'));
-  set('P_USAGE_ID',     s.get('usage'));
-  set('P_PROP_TYPE_ID', s.get('propType'));
-  params['P_TAKE'] = s.get('take') ?? '25';
-  params['P_SKIP'] = s.get('skip') ?? '0';
-
-  const key    = cacheKey('transactions', params);
-  const cached = getCached<DLDResponse<DLDTransaction>>(key);
+  const key    = cacheKey('bayut:transactions', params as unknown as Record<string, string>);
+  const cached = getCached<object>(key);
   if (cached) {
-    return NextResponse.json({ data: cached, source: 'cache' });
+    return NextResponse.json({ ...cached, source: 'cache' });
   }
 
   try {
-    const data = await dldPost<DLDResponse<DLDTransaction>>('transactions', params);
-    setCached(key, data, TTL.TRANSACTIONS);
-    return NextResponse.json({ data, source: 'live' });
+    const raw  = await bayutTransactions(params);
+    const hits = raw.hits.map(normaliseBayutTx);
+    const body = {
+      transactions: hits,
+      total:        raw.nbHits,
+      page:         raw.page,
+      totalPages:   raw.nbPages,
+      source:       'live',
+    };
+    setCached(key, body, TTL.TRANSACTIONS);
+    return NextResponse.json(body);
   } catch (err) {
-    console.error('[DLD transactions]', err);
+    console.error('[BayutAPI transactions]', err);
     return NextResponse.json(
-      { error: 'Failed to fetch from DLD', detail: String(err) },
+      { error: 'Failed to fetch from BayutAPI', detail: String(err) },
       { status: 502 },
     );
   }

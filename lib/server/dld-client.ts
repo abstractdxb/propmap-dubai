@@ -5,8 +5,8 @@
  * - All calls are server-side only → bypasses CORS lock to dubailand.gov.ae
  * - Captcha on the DLD portal is browser-only → no captcha needed here
  * - 800ms minimum gap between requests → avoids bot detection / rate limits
- * - 10s timeout → fail fast rather than hanging a Vercel function
- * - consumer-key comes from env var with public fallback (the key is in DLD's own page JS)
+ * - 15s timeout → fail fast rather than hanging a Vercel function
+ * - consumer-id is the header name used in DLD portal's own boot-1.0.4.js (buildHeaders fn)
  */
 
 const DLD_GATEWAY   = 'https://gateway.dubailand.gov.ae/open-data';
