@@ -1,10 +1,13 @@
 /**
- * BayutAPI client — serves DLD-registered transaction data via RapidAPI.
+ * Bayut / UAE Real Estate API client (RapidAPI: uae-real-estate3.p.rapidapi.com)
  *
- * Endpoint base: https://uae-real-estate3.p.rapidapi.com
- * Auth: x-rapidapi-key header (set RAPIDAPI_KEY in Vercel env vars)
+ * Correct endpoints:
+ *   GET /search-property  — active listings (not /transactions which doesn't exist)
+ *   GET /autocomplete     — location search (not needed at runtime — IDs are hardcoded)
  *
- * Free tier: 900 requests/month. Responses are cached aggressively to minimise usage.
+ * Free tier: 900 req/month. All 55 Bayut location IDs are pre-resolved in
+ * dubai-areas.ts so zero autocomplete calls are needed at runtime.
+ * Each area click = 1 /search-property call, cached 24h.
  */
 
 const BASE    = 'https://uae-real-estate3.p.rapidapi.com';
@@ -17,7 +20,7 @@ function timeoutSignal(ms: number): AbortSignal {
   return c.signal;
 }
 
-function headers() {
+function rapidHeaders() {
   return {
     'x-rapidapi-key':  API_KEY,
     'x-rapidapi-host': 'uae-real-estate3.p.rapidapi.com',
@@ -26,143 +29,120 @@ function headers() {
 
 async function bayutGet<T>(path: string, params: Record<string, string>): Promise<T> {
   const qs  = new URLSearchParams(params).toString();
-  const url = `${BASE}${path}${qs ? '?' + qs : ''}`;
-  const res = await fetch(url, { headers: headers(), signal: timeoutSignal(TIMEOUT) });
+  const url = `${BASE}${path}?${qs}`;
+  const res = await fetch(url, { headers: rapidHeaders(), signal: timeoutSignal(TIMEOUT) });
   if (!res.ok) throw new Error(`BayutAPI ${path} → HTTP ${res.status}`);
   const json = await res.json() as { success: boolean; data: T };
   if (!json.success) throw new Error(`BayutAPI ${path} → success=false`);
   return json.data;
 }
 
-// ── Location autocomplete → resolve community name to externalID ──────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-export interface BayutLocation {
-  id:         number;
-  externalID: string;
-  name:       { en: string };
-  type:       string;
-  level:      number;
-  path:       string;
-  geography:  { lat: number; lng: number };
-}
-
-interface AutocompleteData {
-  locations: BayutLocation[];
-  total:     number;
-}
-
-export async function bayutAutocomplete(query: string): Promise<BayutLocation | null> {
-  const data = await bayutGet<AutocompleteData>('/autocomplete', { query, langs: 'en' });
-  // Prefer exact name match at neighborhood level, then first result
-  const exact = data.locations.find(
-    l => l.name.en.toLowerCase() === query.toLowerCase() && l.level === 2
-  );
-  return exact ?? data.locations[0] ?? null;
-}
-
-// ── Transactions ──────────────────────────────────────────────────────────────
-
-export interface BayutTransaction {
-  transactionId:    string;
+export interface BayutProperty {
+  id:               string;
+  externalID:       string;
+  title:            { en: string };
   purpose:          'for-sale' | 'for-rent';
   price:            number;
-  area:             number;   // sq ft
-  location:         string;
-  category:         string;
-  rooms:            number;
-  completionStatus: string;
-  date:             string;   // YYYY-MM-DD
+  rooms:            number;   // bedrooms
+  baths:            number;
+  area:             number;   // sqm
+  category:         Array<{ name: string; slug: string; level: number }>;
+  completionStatus: string | null;
+  furnishingStatus: string | null;
+  coverPhoto?:      { url: string };
+  location:         Array<{ name?: { en: string }; level: number }>;
 }
 
-export interface BayutTransactionsData {
-  hits:    BayutTransaction[];
-  nbHits:  number;
-  page:    number;
-  nbPages: number;
+export interface BayutSearchData {
+  properties:  BayutProperty[];
+  total:       number;
+  page:        number;
+  totalPages:  number;
+  hitsPerPage: number;
 }
 
-export interface BayutTransactionsParams {
-  purpose:           'for-sale' | 'for-rent';
-  locationIds?:      string;    // comma-separated externalIDs
-  timePeriod?:       '1m' | '3m' | '6m' | '12m' | '24m';
-  categoryIds?:      string;    // 'residential','commercial','apartments','villas',...
-  completionStatus?: 'any' | 'completed' | 'under-construction';
-  beds?:             string;    // comma-separated, '0' = studio
-  priceMin?:         number;
-  priceMax?:         number;
-  sortBy?:           'date_desc' | 'date_asc' | 'price_desc' | 'price_asc';
-  page?:             number;
-}
+// ── Search properties ─────────────────────────────────────────────────────────
 
-export async function bayutTransactions(
-  params: BayutTransactionsParams
-): Promise<BayutTransactionsData> {
+export async function bayutSearchProperty(params: {
+  locationExternalId: string;
+  purpose:            'for-sale' | 'for-rent';
+  page?:              number;
+  rooms?:             string;   // '1,2,3' etc
+  priceMin?:          number;
+  priceMax?:          number;
+  categorySlug?:      string;   // 'apartments', 'villas', etc.
+}): Promise<BayutSearchData> {
   const q: Record<string, string> = {
-    purpose:    params.purpose,
-    time_period: params.timePeriod  ?? '12m',
-    sort_by:    params.sortBy       ?? 'date_desc',
-    page:       String(params.page  ?? 1),
+    location_external_id: params.locationExternalId,
+    purpose:              params.purpose,
+    page:                 String(params.page ?? 1),
+    langs:                'en',
   };
-  if (params.locationIds)      q.location_ids      = params.locationIds;
-  if (params.categoryIds)      q.category_ids      = params.categoryIds;
-  if (params.completionStatus) q.completion_status = params.completionStatus;
-  if (params.beds)             q.beds              = params.beds;
-  if (params.priceMin)         q.price_min         = String(params.priceMin);
-  if (params.priceMax)         q.price_max         = String(params.priceMax);
+  if (params.rooms)        q.rooms       = params.rooms;
+  if (params.priceMin)     q.price_min   = String(params.priceMin);
+  if (params.priceMax)     q.price_max   = String(params.priceMax);
+  if (params.categorySlug) q.category    = params.categorySlug;
 
-  return bayutGet<BayutTransactionsData>('/transactions', q);
+  return bayutGet<BayutSearchData>('/search-property', q);
 }
 
-// ── Normalise to a shape MapApp already understands ──────────────────────────
+// ── Normalised listing shape (used by MapApp) ─────────────────────────────────
 
-export interface NormalisedTransaction {
-  id:          string;
-  date:        string;   // YYYY-MM-DD
-  type:        string;   // 'Sale' | 'Rent'
-  propType:    string;   // 'Apartment' | 'Villa' | ...
-  areaSqft:    number;
-  areaSqm:     number;
-  priceFull:   number;   // AED
-  psfAED:      number;   // AED / sqft
-  rooms:       string;   // '1 B/R' | 'Studio' | ...
-  location:    string;
-  status:      string;   // 'Completed' | 'Off-Plan'
+export interface NormalisedListing {
+  id:        string;
+  title:     string;
+  purpose:   'Sale' | 'Rent';
+  price:     number;       // AED
+  rooms:     number;       // bedrooms
+  baths:     number;
+  areaSqm:   number;
+  areaSqft:  number;
+  psfAED:    number;       // AED per sqft
+  propType:  string;       // 'Apartments', 'Villas', etc.
+  status:    string;       // 'Ready' | 'Off-Plan' | '—'
+  furnished: string;       // 'Furnished' | 'Unfurnished' | '—'
+  imageUrl:  string;
 }
 
-function roomLabel(rooms: number): string {
-  if (rooms === 0) return 'Studio';
-  return `${rooms} B/R`;
+function propTypeLabel(category: BayutProperty['category']): string {
+  const lvl1 = category?.find(c => c.level === 1);
+  return lvl1?.name ?? 'Property';
 }
 
-function categoryLabel(cat: string): string {
-  const map: Record<string, string> = {
-    apartments:  'Apartment',
-    villas:      'Villa',
-    townhouses:  'Townhouse',
-    residential: 'Residential',
-    commercial:  'Commercial',
-    offices:     'Office',
-    shops:       'Shop',
-  };
-  return map[cat.toLowerCase()] ?? cat;
+function statusLabel(s: string | null): string {
+  if (!s) return '—';
+  if (s === 'ready')    return 'Ready';
+  if (s === 'off_plan') return 'Off-Plan';
+  return s;
 }
 
-export function normaliseBayutTx(tx: BayutTransaction): NormalisedTransaction {
-  const areaSqft = tx.area;
-  const areaSqm  = Math.round(areaSqft / 10.764 * 10) / 10;
-  const psfAED   = areaSqft > 0 ? Math.round(tx.price / areaSqft) : 0;
+function furnishedLabel(s: string | null): string {
+  if (!s) return '—';
+  if (s === 'furnished')      return 'Furnished';
+  if (s === 'unfurnished')    return 'Unfurnished';
+  if (s === 'part-furnished') return 'Part Furnished';
+  return s;
+}
 
+export function normaliseBayutListing(p: BayutProperty): NormalisedListing {
+  const areaSqm  = p.area ?? 0;
+  const areaSqft = Math.round(areaSqm * 10.764);
+  const psfAED   = areaSqft > 0 ? Math.round(p.price / areaSqft) : 0;
   return {
-    id:        tx.transactionId,
-    date:      tx.date,
-    type:      tx.purpose === 'for-sale' ? 'Sale' : 'Rent',
-    propType:  categoryLabel(tx.category),
+    id:        p.id,
+    title:     p.title?.en ?? '',
+    purpose:   p.purpose === 'for-sale' ? 'Sale' : 'Rent',
+    price:     p.price ?? 0,
+    rooms:     p.rooms ?? 0,
+    baths:     p.baths ?? 0,
+    areaSqm:   Math.round(areaSqm * 10) / 10,
     areaSqft,
-    areaSqm,
-    priceFull: tx.price,
     psfAED,
-    rooms:     roomLabel(tx.rooms),
-    location:  tx.location,
-    status:    tx.completionStatus === 'completed' ? 'Completed' : 'Off-Plan',
+    propType:  propTypeLabel(p.category),
+    status:    statusLabel(p.completionStatus),
+    furnished: furnishedLabel(p.furnishingStatus),
+    imageUrl:  p.coverPhoto?.url ?? '',
   };
 }

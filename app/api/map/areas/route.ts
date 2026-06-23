@@ -4,7 +4,7 @@ import { DUBAI_COMMUNITIES } from '@/lib/server/dubai-areas';
 
 export const runtime = 'nodejs';
 
-const CACHE_KEY = 'map:areas:geojson:v3';
+const CACHE_KEY = 'map:areas:geojson:v4';
 
 export async function GET() {
   const cached = getCached<object>(CACHE_KEY);
@@ -17,9 +17,9 @@ export async function GET() {
       coordinates: [comm.lng, comm.lat] as [number, number],
     },
     properties: {
-      id:         comm.id,
-      name:       comm.name,
-      bayutQuery: comm.name,
+      id:      comm.id,
+      name:    comm.name,
+      bayutId: comm.bayutId,   // pre-resolved — no autocomplete call needed
     },
   }));
 

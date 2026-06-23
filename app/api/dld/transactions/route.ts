@@ -1,73 +1,70 @@
 /**
  * GET /api/dld/transactions
  *
- * Proxies to BayutAPI (RapidAPI) instead of the DLD gateway, which is WAF-blocked
- * for all Vercel server-side IPs.
+ * Returns Bayut property listings for a Dubai community.
+ * "transactions" is a legacy name kept for URL compatibility.
  *
- * Query params accepted:
- *   purpose      'for-sale' | 'for-rent'  (default: 'for-sale')
- *   locationIds  comma-separated Bayut externalIDs  (e.g. '5003')
- *   timePeriod   '1m' | '3m' | '6m' | '12m' | '24m'  (default: '12m')
- *   category     'apartments' | 'villas' | 'townhouses' | 'commercial' | ...
- *   status       'completed' | 'under-construction' | 'any'
- *   beds         comma-separated bedroom counts (0 = studio)
- *   priceMin     number
- *   priceMax     number
- *   sortBy       'date_desc' | 'date_asc' | 'price_desc' | 'price_asc'
- *   page         number  (default: 1)
+ * Params:
+ *   locationId  string   Bayut externalID (pre-resolved, hardcoded in dubai-areas.ts)
+ *   purpose     string   'for-sale' | 'for-rent'  (default: 'for-sale')
+ *   page        number   (default: 1)
+ *   rooms       string   comma-separated bedroom counts
+ *   priceMin    number
+ *   priceMax    number
+ *   category    string   'apartments' | 'villas' | etc.
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import {
-  bayutTransactions,
-  normaliseBayutTx,
-  BayutTransactionsParams,
-} from '@/lib/server/bayut-client';
-import { getCached, setCached, cacheKey, TTL } from '@/lib/server/dld-cache';
+import { bayutSearchProperty, normaliseBayutListing, BayutSearchData } from '@/lib/server/bayut-client';
+import { getCached, setCached, TTL } from '@/lib/server/dld-cache';
 
 export const runtime = 'nodejs';
 
 export async function GET(req: NextRequest) {
   const s = req.nextUrl.searchParams;
 
-  const purpose = (s.get('purpose') ?? 'for-sale') as 'for-sale' | 'for-rent';
-  const page    = Number(s.get('page') ?? '1');
-
-  const params: BayutTransactionsParams = {
-    purpose,
-    page,
-    locationIds:      s.get('locationIds')  ?? undefined,
-    timePeriod:       (s.get('timePeriod')  as BayutTransactionsParams['timePeriod']) ?? '12m',
-    categoryIds:      s.get('category')     ?? undefined,
-    completionStatus: (s.get('status')      as BayutTransactionsParams['completionStatus']) ?? undefined,
-    beds:             s.get('beds')         ?? undefined,
-    priceMin:         s.get('priceMin')     ? Number(s.get('priceMin'))  : undefined,
-    priceMax:         s.get('priceMax')     ? Number(s.get('priceMax'))  : undefined,
-    sortBy:           (s.get('sortBy')      as BayutTransactionsParams['sortBy'])      ?? 'date_desc',
-  };
-
-  const key    = cacheKey('bayut:transactions', params as unknown as Record<string, string>);
-  const cached = getCached<object>(key);
-  if (cached) {
-    return NextResponse.json({ ...cached, source: 'cache' });
+  const locationId = s.get('locationId');
+  if (!locationId) {
+    return NextResponse.json({ error: 'locationId is required' }, { status: 400 });
   }
 
+  const purpose  = (s.get('purpose') ?? 'for-sale') as 'for-sale' | 'for-rent';
+  const page     = Number(s.get('page') ?? '1');
+  const rooms    = s.get('rooms')    ?? undefined;
+  const priceMin = s.get('priceMin') ? Number(s.get('priceMin')) : undefined;
+  const priceMax = s.get('priceMax') ? Number(s.get('priceMax')) : undefined;
+  const category = s.get('category') ?? undefined;
+
+  const cKey = `bayut:listings:${locationId}:${purpose}:${page}:${rooms ?? ''}:${priceMin ?? ''}:${priceMax ?? ''}:${category ?? ''}`;
+  const cached = getCached<object>(cKey);
+  if (cached) return NextResponse.json({ ...cached, source: 'cache' });
+
   try {
-    const raw  = await bayutTransactions(params);
-    const hits = raw.hits.map(normaliseBayutTx);
+    const raw = await bayutSearchProperty({
+      locationExternalId: locationId,
+      purpose,
+      page,
+      rooms,
+      priceMin,
+      priceMax,
+      categorySlug: category,
+    });
+
+    const listings = raw.properties.map(normaliseBayutListing);
     const body = {
-      transactions: hits,
-      total:        raw.nbHits,
-      page:         raw.page,
-      totalPages:   raw.nbPages,
-      source:       'live',
+      listings,
+      total:      raw.total,
+      page:       raw.page,
+      totalPages: raw.totalPages,
+      source:     'live',
     };
-    setCached(key, body, TTL.TRANSACTIONS);
+    // Cache 24h — listings don't change minute-to-minute
+    setCached(cKey, body, TTL.TRANSACTIONS);
     return NextResponse.json(body);
   } catch (err) {
-    console.error('[BayutAPI transactions]', err);
+    console.error('[BayutAPI listings]', err);
     return NextResponse.json(
-      { error: 'Failed to fetch from BayutAPI', detail: String(err) },
+      { error: 'Failed to fetch listings', detail: String(err) },
       { status: 502 },
     );
   }
