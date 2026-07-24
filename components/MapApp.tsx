@@ -8,6 +8,7 @@ import {
 } from 'chart.js';
 import { Bar, Doughnut } from 'react-chartjs-2';
 import { DEVELOPER_COLORS } from '@/lib/data';
+import { DUBAI_COMMUNITIES } from '@/lib/server/dubai-areas';
 import type { NormalisedListing } from '@/lib/server/bayut-client';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement,
@@ -15,9 +16,10 @@ ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement,
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Plan      = 'free' | 'pro' | 'admin';
-type MapStyle  = 'dark' | 'satellite' | 'streets';
-type ActiveTab = 'overview' | 'listings' | 'trends';
+type Plan        = 'free' | 'pro' | 'admin';
+type MapStyle    = 'dark' | 'satellite' | 'streets';
+type ActiveTab   = 'overview' | 'listings' | 'trends';
+type TrafficWin  = 'live' | 'morning' | 'evening';
 
 interface AreaFeature {
   id:      string;
@@ -50,6 +52,202 @@ const MAP_STYLES: Record<MapStyle, string> = {
   streets:   'mapbox://styles/mapbox/streets-v12',
 };
 
+const TRAFFIC_LABELS: Record<TrafficWin, string> = {
+  live:    '🔴 Live',
+  morning: '🌅 Morning Rush (6–9 AM)',
+  evening: '🌆 Evening Rush (5–8 PM)',
+};
+
+const PROP_TYPES = ['Apartment', 'Villa', 'Townhouse', 'Office'];
+const TX_TYPES   = ['Sales', 'Rentals'];
+
+// ─── Circle polygon helper (no external dep needed) ──────────────────────────
+
+function makeCirclePolygon(
+  lat: number, lng: number, radiusKm: number, numPts = 48,
+): [number, number][] {
+  const coords: [number, number][] = [];
+  for (let i = 0; i <= numPts; i++) {
+    const angle  = (i / numPts) * 2 * Math.PI;
+    const dx     = (radiusKm / (111.32 * Math.cos(lat * Math.PI / 180))) * Math.cos(angle);
+    const dy     = (radiusKm / 110.54) * Math.sin(angle);
+    coords.push([lng + dx, lat + dy]);
+  }
+  return coords;
+}
+
+function buildBordersGeoJSON(): GeoJSON.FeatureCollection {
+  return {
+    type: 'FeatureCollection',
+    features: DUBAI_COMMUNITIES.map(c => ({
+      type: 'Feature' as const,
+      geometry: { type: 'Polygon' as const, coordinates: [makeCirclePolygon(c.lat, c.lng, c.radiusKm)] },
+      properties: { id: c.id, name: c.name },
+    })),
+  };
+}
+
+// ─── Water colour per style ───────────────────────────────────────────────────
+
+const WATER_COLORS: Record<MapStyle, string> = {
+  dark:      '#0d2b45',
+  satellite: '#1a4a7a',
+  streets:   '#4fc3f7',
+};
+
+function applyWaterColor(map: mapboxgl.Map, style: MapStyle) {
+  const col = WATER_COLORS[style];
+  const waterLayers = ['water', 'water-shadow', 'waterway', 'waterway-river-lake', 'water-depth'];
+  waterLayers.forEach(id => {
+    try {
+      if (!map.getLayer(id)) return;
+      const lyr = map.getStyle().layers?.find(l => l.id === id);
+      if (lyr?.type === 'fill') {
+        map.setPaintProperty(id, 'fill-color', col);
+        map.setPaintProperty(id, 'fill-opacity', style === 'dark' ? 1 : 0.85);
+      } else if (lyr?.type === 'line') {
+        map.setPaintProperty(id, 'line-color', col);
+      }
+    } catch { /* some layers may not exist in all styles */ }
+  });
+}
+
+function suppressStreetNamesAtLowZoom(map: mapboxgl.Map) {
+  // Push all road / street label layers to only show at zoom ≥ 13
+  const streetKeywords = ['street', 'road', 'path', 'highway', 'motorway', 'link', 'service'];
+  try {
+    map.getStyle().layers?.forEach(layer => {
+      if (layer.type !== 'symbol') return;
+      const id = layer.id.toLowerCase();
+      if (streetKeywords.some(kw => id.includes(kw))) {
+        try { map.setLayerZoomRange(layer.id, 13, 24); } catch { /* skip read-only layers */ }
+      }
+    });
+  } catch { /* ignore */ }
+}
+
+// ─── Mapbox layers setup ──────────────────────────────────────────────────────
+
+function setupLayers(
+  map: mapboxgl.Map,
+  geojson: AreaGeoJSON | null,
+  style: MapStyle,
+) {
+  const emptyFC: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
+
+  // 3D buildings — lower minzoom so they appear earlier while zooming in
+  if (!map.getLayer('3d-buildings')) {
+    try {
+      map.addLayer({
+        id: '3d-buildings', source: 'composite', 'source-layer': 'building',
+        filter: ['==', 'extrude', 'true'], type: 'fill-extrusion', minzoom: 10,
+        paint: {
+          'fill-extrusion-color': '#1e2330',
+          'fill-extrusion-height': ['get', 'height'],
+          'fill-extrusion-base': ['get', 'min_height'],
+          'fill-extrusion-opacity': 0.65,
+        },
+      });
+    } catch { /* ignore */ }
+  }
+
+  // Area border circles
+  if (!map.getSource('area-borders')) {
+    map.addSource('area-borders', { type: 'geojson', data: buildBordersGeoJSON() });
+    map.addLayer({
+      id: 'area-borders-fill', type: 'fill', source: 'area-borders',
+      paint: { 'fill-color': '#3b82f6', 'fill-opacity': 0.04 },
+    });
+    map.addLayer({
+      id: 'area-borders-line', type: 'line', source: 'area-borders',
+      paint: { 'line-color': '#3b82f6', 'line-width': 1.5, 'line-opacity': 0.45, 'line-dasharray': [4, 3] },
+    });
+  }
+
+  // Area dot points
+  if (!map.getSource('areas')) {
+    map.addSource('areas', { type: 'geojson', data: (geojson as unknown as GeoJSON.FeatureCollection) ?? emptyFC });
+    map.addLayer({
+      id: 'area-points', type: 'circle', source: 'areas',
+      paint: {
+        'circle-color': '#3b82f6',
+        'circle-radius': ['interpolate', ['linear'], ['zoom'], 8, 4, 11, 7, 14, 10],
+        'circle-stroke-width': 2,
+        'circle-stroke-color': 'rgba(255,255,255,0.6)',
+        'circle-opacity': 0.95,
+      },
+    });
+    map.addLayer({
+      id: 'area-labels', type: 'symbol', source: 'areas', minzoom: 10,
+      layout: {
+        'text-field': ['get', 'name'],
+        'text-font': ['DIN Offc Pro Medium', 'Arial Unicode MS Bold'],
+        'text-size': ['interpolate', ['linear'], ['zoom'], 10, 10, 14, 13],
+        'text-offset': [0, 0.9],
+        'text-anchor': 'top',
+        'text-max-width': 10,
+        'text-allow-overlap': false,
+      },
+      paint: {
+        'text-color': '#e2e8f0',
+        'text-halo-color': 'rgba(13,15,20,0.95)',
+        'text-halo-width': 1.8,
+      },
+    });
+  }
+
+  // Heatmap (price intensity)
+  if (!map.getSource('heatmap-data')) {
+    map.addSource('heatmap-data', { type: 'geojson', data: emptyFC });
+    map.addLayer({
+      id: 'price-heatmap', type: 'heatmap', source: 'heatmap-data',
+      layout: { visibility: 'none' },
+      paint: {
+        'heatmap-weight': 1,
+        'heatmap-intensity': 0.8,
+        'heatmap-color': [
+          'interpolate', 'linear', ['heatmap-density'],
+          0, 'rgba(0,0,0,0)',
+          0.3, 'rgba(16,185,129,0.5)',
+          0.6, 'rgba(245,158,11,0.7)',
+          1, 'rgba(239,68,68,0.9)',
+        ],
+        'heatmap-radius': 55,
+        'heatmap-opacity': 0.75,
+      },
+    });
+  }
+
+  // Traffic layer (Mapbox live traffic)
+  if (!map.getSource('mapbox-traffic')) {
+    try {
+      map.addSource('mapbox-traffic', { type: 'vector', url: 'mapbox://mapbox.mapbox-traffic-v1' });
+      map.addLayer({
+        id: 'traffic-layer', type: 'line', source: 'mapbox-traffic',
+        'source-layer': 'traffic',
+        layout: { visibility: 'none', 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-width': ['interpolate', ['linear'], ['zoom'], 8, 1.5, 13, 3, 16, 5],
+          'line-color': [
+            'match', ['get', 'congestion'],
+            'low',      '#10b981',
+            'moderate', '#f59e0b',
+            'heavy',    '#ef4444',
+            'severe',   '#7c1d1d',
+            '#10b981',
+          ],
+          'line-opacity': 0.85,
+        },
+      });
+    } catch { /* traffic tileset may not be accessible in all plans */ }
+  }
+
+  applyWaterColor(map, style);
+  suppressStreetNamesAtLowZoom(map);
+}
+
+// ─── Chart helpers ─────────────────────────────────────────────────────────────
+
 const CHART_OPTS = {
   responsive: true, maintainAspectRatio: false,
   plugins: { legend: { display: false } },
@@ -59,22 +257,14 @@ const CHART_OPTS = {
   },
 };
 
-const PROP_TYPES = ['Apartment', 'Villa', 'Townhouse', 'Office'];
-const TX_TYPES   = ['Sales', 'Rentals'];
-
-// ─── Chart helpers ─────────────────────────────────────────────────────────────
-
-function roomLabel(rooms: number): string {
-  if (rooms === 0) return 'Studio';
-  return `${rooms} BR`;
-}
+function roomLabel(rooms: number): string { return rooms === 0 ? 'Studio' : `${rooms} BR`; }
 
 function computeStats(listings: NormalisedListing[], total: number) {
   const sales    = listings.filter(l => l.purpose === 'Sale' && l.price > 0);
   const withSize = sales.filter(l => l.areaSqft > 0);
   const avgPsf   = withSize.length ? Math.round(withSize.reduce((s, l) => s + l.psfAED, 0) / withSize.length) : 0;
-  const avgPrice = sales.length    ? Math.round(sales.reduce((s, l) => s + l.price, 0) / sales.length) : 0;
-  const minPrice = sales.length    ? Math.min(...sales.map(l => l.price)) : 0;
+  const avgPrice = sales.length ? Math.round(sales.reduce((s, l) => s + l.price, 0) / sales.length) : 0;
+  const minPrice = sales.length ? Math.min(...sales.map(l => l.price)) : 0;
   return { total, avgPsf, avgPrice, minPrice };
 }
 
@@ -86,26 +276,23 @@ function priceByBedroomChart(listings: NormalisedListing[]) {
     if (!byBed[k]) byBed[k] = [];
     byBed[k].push(l.price);
   });
-  const order = ['Studio', '1 BR', '2 BR', '3 BR', '4 BR', '5 BR'];
+  const order  = ['Studio', '1 BR', '2 BR', '3 BR', '4 BR', '5 BR'];
   const labels = order.filter(l => byBed[l]?.length);
-  const avg = (a: number[]) => Math.round(a.reduce((s, v) => s + v, 0) / a.length);
+  const avg    = (a: number[]) => Math.round(a.reduce((s, v) => s + v, 0) / a.length);
   return {
     labels,
     datasets: [
-      { label: 'Min',  data: labels.map(l => Math.min(...byBed[l])), backgroundColor: 'rgba(59,130,246,0.35)', borderRadius: 4 },
-      { label: 'Avg',  data: labels.map(l => avg(byBed[l])),         backgroundColor: 'rgba(59,130,246,0.85)', borderRadius: 4 },
-      { label: 'Max',  data: labels.map(l => Math.max(...byBed[l])), backgroundColor: 'rgba(59,130,246,0.2)',  borderRadius: 4 },
+      { label: 'Min', data: labels.map(l => Math.min(...byBed[l])), backgroundColor: 'rgba(59,130,246,0.35)', borderRadius: 4 },
+      { label: 'Avg', data: labels.map(l => avg(byBed[l])),         backgroundColor: 'rgba(59,130,246,0.85)', borderRadius: 4 },
+      { label: 'Max', data: labels.map(l => Math.max(...byBed[l])), backgroundColor: 'rgba(59,130,246,0.2)',  borderRadius: 4 },
     ],
   };
 }
 
 function bedroomMixChart(listings: NormalisedListing[]) {
   const counts: Record<string, number> = {};
-  listings.forEach(l => {
-    const k = roomLabel(l.rooms);
-    counts[k] = (counts[k] ?? 0) + 1;
-  });
-  const order = ['Studio', '1 BR', '2 BR', '3 BR', '4 BR', '5 BR'];
+  listings.forEach(l => { const k = roomLabel(l.rooms); counts[k] = (counts[k] ?? 0) + 1; });
+  const order  = ['Studio', '1 BR', '2 BR', '3 BR', '4 BR', '5 BR'];
   const labels = order.filter(l => counts[l]);
   return {
     labels,
@@ -140,7 +327,7 @@ function LoginScreen({ onLogin }: { onLogin: (p: Plan) => void }) {
               {[
                 ['🏙️','55 Dubai Communities','All major neighbourhoods with live Bayut listing data'],
                 ['📊','350K+ Active Listings','Real prices, sizes, and specs from Bayut UAE'],
-                ['🗺️','Interactive Mapbox Map','3D buildings, heatmap, click any area for data'],
+                ['🗺️','Interactive Mapbox Map','3D buildings, traffic overlay, area borders'],
                 ['🔍','Filter by Type & Purpose','Sale vs rent, apartments vs villas'],
               ].map(([icon, title, desc]) => (
                 <div key={title} className="flex gap-3 items-start">
@@ -200,25 +387,6 @@ function Chip({ label, active, color, onClick }: { label: string; active: boolea
   );
 }
 
-function NoTokenWarning() {
-  return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center pointer-events-none">
-      <div className="rounded-xl border px-6 py-5 max-w-sm text-center pointer-events-auto"
-        style={{ background:'rgba(30,35,48,0.97)', borderColor:'#f59e0b' }}>
-        <div className="text-2xl mb-2">🗺️</div>
-        <div className="text-sm font-bold text-[#f59e0b] mb-1">Mapbox token not configured</div>
-        <div className="text-[11px] text-[#94a3b8] leading-relaxed mb-3">
-          Add <code className="text-[#10b981]">NEXT_PUBLIC_MAPBOX_TOKEN</code> to Vercel environment variables.
-        </div>
-        <a href="https://account.mapbox.com" target="_blank" rel="noreferrer"
-          className="inline-block text-xs font-semibold px-4 py-2 rounded-lg" style={{ background:'#f59e0b', color:'#0d0f14' }}>
-          Get free token → mapbox.com
-        </a>
-      </div>
-    </div>
-  );
-}
-
 function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
     <div className="rounded-lg p-3 border" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
@@ -229,24 +397,18 @@ function StatCard({ label, value, sub }: { label: string; value: string; sub?: s
   );
 }
 
-function setupLayers(map: mapboxgl.Map, geojson: AreaGeoJSON | null) {
-  if (!map.getLayer('3d-buildings')) {
-    try { map.addLayer({ id:'3d-buildings', source:'composite', 'source-layer':'building', filter:['==','extrude','true'], type:'fill-extrusion', minzoom:13, paint:{'fill-extrusion-color':'#1e2330','fill-extrusion-height':['get','height'],'fill-extrusion-base':['get','min_height'],'fill-extrusion-opacity':0.65} }); } catch { /* ignore */ }
-  }
-  const emptyFC: GeoJSON.FeatureCollection = { type:'FeatureCollection', features:[] };
-  if (!map.getSource('areas')) {
-    map.addSource('areas', { type:'geojson', data:(geojson as unknown as GeoJSON.FeatureCollection) ?? emptyFC });
-    map.addLayer({ id:'area-points', type:'circle', source:'areas',
-      paint: { 'circle-color':'#3b82f6', 'circle-radius':['interpolate',['linear'],['zoom'],9,5,12,8,15,12], 'circle-stroke-width':2, 'circle-stroke-color':'rgba(255,255,255,0.5)', 'circle-opacity':0.9 } });
-    map.addLayer({ id:'area-labels', type:'symbol', source:'areas', minzoom:11,
-      layout: { 'text-field':['get','name'], 'text-font':['DIN Offc Pro Medium','Arial Unicode MS Bold'], 'text-size':11, 'text-offset':[0,1.3], 'text-anchor':'top', 'text-max-width':10 },
-      paint: { 'text-color':'#e2e8f0', 'text-halo-color':'rgba(13,15,20,0.9)', 'text-halo-width':1.5 } });
-  }
-  if (!map.getSource('heatmap-data')) {
-    map.addSource('heatmap-data', { type:'geojson', data:emptyFC });
-    map.addLayer({ id:'price-heatmap', type:'heatmap', source:'heatmap-data', layout:{ visibility:'none' },
-      paint: { 'heatmap-weight':1, 'heatmap-intensity':0.8, 'heatmap-color':['interpolate','linear',['heatmap-density'],0,'rgba(0,0,0,0)',0.3,'rgba(16,185,129,0.5)',0.6,'rgba(245,158,11,0.7)',1,'rgba(239,68,68,0.9)'], 'heatmap-radius':55, 'heatmap-opacity':0.75 } });
-  }
+function IconBtn({ label, title, active, onClick }: { label: string; title?: string; active?: boolean; onClick: () => void }) {
+  return (
+    <button onClick={onClick} title={title} className="w-9 h-9 rounded-lg flex items-center justify-center border text-sm"
+      style={{
+        background: active ? 'rgba(59,130,246,.15)' : 'rgba(13,15,20,0.9)',
+        backdropFilter: 'blur(8px)',
+        borderColor: active ? '#3b82f6' : '#2a3040',
+        color: active ? '#3b82f6' : '#94a3b8',
+      }}>
+      {label}
+    </button>
+  );
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
@@ -255,23 +417,29 @@ export default function MapApp() {
   const mapContainer    = useRef<HTMLDivElement>(null);
   const mapRef          = useRef<mapboxgl.Map | null>(null);
   const areasGeoJSONRef = useRef<AreaGeoJSON | null>(null);
+  const currentStyleRef = useRef<MapStyle>('dark');
 
-  const [plan,         setPlan]         = useState<Plan | null>(null);
-  const [mapReady,     setMapReady]     = useState(false);
-  const [areasGeoJSON, setAreasGeoJSON] = useState<AreaGeoJSON | null>(null);
-  const [areaNames,    setAreaNames]    = useState<string[]>([]);
-  const [areasLoading, setAreasLoading] = useState(false);
-  const [selectedArea, setSelectedArea] = useState<AreaFeature | null>(null);
-  const [listings,     setListings]     = useState<NormalisedListing[] | null>(null);
-  const [listTotal,    setListTotal]    = useState(0);
-  const [loading,      setLoading]      = useState(false);
-  const [dataSource,   setDataSource]   = useState<'live' | 'none' | null>(null);
-  const [activeTab,    setActiveTab]    = useState<ActiveTab>('overview');
-  const [mapStyle,     setMapStyle]     = useState<MapStyle>('dark');
-  const [filters,      setFilters]      = useState<Filters>(EMPTY_FILTERS);
-  const [heatmap,      setHeatmap]      = useState(false);
-  const [sidebarOpen,  setSidebarOpen]  = useState(true);
-  const [toast,        setToast]        = useState('');
+  const [plan,          setPlan]         = useState<Plan | null>(null);
+  const [mapReady,      setMapReady]     = useState(false);
+  const [areasGeoJSON,  setAreasGeoJSON] = useState<AreaGeoJSON | null>(null);
+  const [areaNames,     setAreaNames]    = useState<string[]>([]);
+  const [areasLoading,  setAreasLoading] = useState(false);
+  const [selectedArea,  setSelectedArea] = useState<AreaFeature | null>(null);
+  const [listings,      setListings]     = useState<NormalisedListing[] | null>(null);
+  const [listTotal,     setListTotal]    = useState(0);
+  const [loading,       setLoading]      = useState(false);
+  const [dataSource,    setDataSource]   = useState<'live' | 'none' | null>(null);
+  const [activeTab,     setActiveTab]    = useState<ActiveTab>('overview');
+  const [mapStyle,      setMapStyle]     = useState<MapStyle>('dark');
+  const [filters,       setFilters]      = useState<Filters>(EMPTY_FILTERS);
+  const [heatmap,       setHeatmap]      = useState(false);
+  const [showBorders,   setShowBorders]  = useState(true);
+  const [showTraffic,   setShowTraffic]  = useState(false);
+  const [trafficWin,    setTrafficWin]   = useState<TrafficWin>('live');
+  const [sidebarOpen,   setSidebarOpen]  = useState(true);
+  const [toast,         setToast]        = useState('');
+  const [zoomLevel,     setZoomLevel]    = useState(11.0);
+
   const hasToken = Boolean(process.env.NEXT_PUBLIC_MAPBOX_TOKEN);
 
   const showToast = useCallback((msg: string) => { setToast(msg); setTimeout(() => setToast(''), 2800); }, []);
@@ -283,7 +451,11 @@ export default function MapApp() {
     setAreasLoading(true);
     fetch('/api/map/areas')
       .then(r => r.json())
-      .then((gj: AreaGeoJSON) => { areasGeoJSONRef.current = gj; setAreasGeoJSON(gj); setAreaNames(gj.features.map(f => f.properties.name).sort()); })
+      .then((gj: AreaGeoJSON) => {
+        areasGeoJSONRef.current = gj;
+        setAreasGeoJSON(gj);
+        setAreaNames(gj.features.map(f => f.properties.name).sort());
+      })
       .catch(e => console.error('[PropMap] areas load failed', e))
       .finally(() => setAreasLoading(false));
   }, [plan]);
@@ -292,27 +464,46 @@ export default function MapApp() {
   useEffect(() => {
     if (!plan || !mapContainer.current || mapRef.current) return;
     mapboxgl.accessToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? '';
-    const map = new mapboxgl.Map({ container: mapContainer.current, style: MAP_STYLES.dark, center:[55.2708,25.2048], zoom:11, pitch:45, bearing:-10, antialias:true });
+
+    const map = new mapboxgl.Map({
+      container: mapContainer.current,
+      style: MAP_STYLES.dark,
+      center: [55.2708, 25.2048],
+      zoom: 11,
+      pitch: 45,
+      bearing: -10,
+      antialias: true,
+    });
+
     map.on('load', () => {
-      setupLayers(map, areasGeoJSONRef.current);
+      setupLayers(map, areasGeoJSONRef.current, 'dark');
+
+      // Zoom level tracker
+      map.on('zoom', () => setZoomLevel(Math.round(map.getZoom() * 10) / 10));
+
+      // Click handler
       map.on('click', e => {
         if (!map.getLayer('area-points')) return;
-        const features = map.queryRenderedFeatures(e.point, { layers:['area-points'] });
+        const features = map.queryRenderedFeatures(e.point, { layers: ['area-points'] });
         if (!features.length) return;
-        const p = features[0].properties as { id: string; name: string; bayutId: string };
+        const p   = features[0].properties as { id: string; name: string; bayutId: string };
         const geo = features[0].geometry as GeoJSON.Point;
-        setSelectedArea({ id:p.id, name:p.name, bayutId:p.bayutId, lat:geo.coordinates[1], lng:geo.coordinates[0] });
+        setSelectedArea({ id: p.id, name: p.name, bayutId: p.bayutId, lat: geo.coordinates[1], lng: geo.coordinates[0] });
         setActiveTab('overview');
-        map.flyTo({ center:[geo.coordinates[0],geo.coordinates[1]], zoom:Math.max(map.getZoom(),13), pitch:60, speed:0.9 });
+        map.flyTo({ center: [geo.coordinates[0], geo.coordinates[1]], zoom: Math.max(map.getZoom(), 13), pitch: 60, speed: 0.9 });
       });
+
       map.on('mousemove', e => {
         if (!map.getLayer('area-points')) return;
-        map.getCanvas().style.cursor = map.queryRenderedFeatures(e.point, { layers:['area-points'] }).length ? 'pointer' : '';
+        map.getCanvas().style.cursor = map.queryRenderedFeatures(e.point, { layers: ['area-points'] }).length ? 'pointer' : '';
       });
+
       setMapReady(true);
     });
+
     mapRef.current = map;
-    showToast(plan==='admin' ? '👋 Welcome, Admin — full access' : '👋 Welcome back, Charan');
+    showToast(plan === 'admin' ? '👋 Welcome, Admin — full access' : '👋 Welcome back, Charan');
+
     return () => { map.remove(); mapRef.current = null; setMapReady(false); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plan]);
@@ -322,17 +513,29 @@ export default function MapApp() {
     const map = mapRef.current;
     if (!map || !areasGeoJSON || !mapReady) return;
     (map.getSource('areas') as mapboxgl.GeoJSONSource | undefined)?.setData(areasGeoJSON as unknown as GeoJSON.FeatureCollection);
-    (map.getSource('heatmap-data') as mapboxgl.GeoJSONSource | undefined)?.setData({ type:'FeatureCollection', features: areasGeoJSON.features.map(f => ({ type:'Feature' as const, geometry:f.geometry, properties:{ weight:1 } })) });
+    (map.getSource('heatmap-data') as mapboxgl.GeoJSONSource | undefined)?.setData({
+      type: 'FeatureCollection',
+      features: areasGeoJSON.features.map(f => ({ type: 'Feature' as const, geometry: f.geometry, properties: { weight: 1 } })),
+    });
   }, [areasGeoJSON, mapReady]);
 
   // ── Area filter
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady || !map.getLayer('area-points')) return;
-    if (!filters.areas.length) { map.setFilter('area-points', null); map.setFilter('area-labels', null); }
-    else {
-      const f = ['in',['get','name'],['literal',filters.areas]] as mapboxgl.FilterSpecification;
-      map.setFilter('area-points', f); map.setFilter('area-labels', f);
+    if (!filters.areas.length) {
+      map.setFilter('area-points', null);
+      map.setFilter('area-labels', null);
+      map.setFilter('area-borders-line', null);
+      map.setFilter('area-borders-fill', null);
+    } else {
+      const f = ['in', ['get', 'id'], ['literal', filters.areas.map(n =>
+        DUBAI_COMMUNITIES.find(c => c.name === n)?.id ?? n
+      )]] as mapboxgl.FilterSpecification;
+      map.setFilter('area-points', f);
+      map.setFilter('area-labels', f);
+      map.setFilter('area-borders-line', f);
+      map.setFilter('area-borders-fill', f);
     }
   }, [filters.areas, mapReady]);
 
@@ -342,17 +545,12 @@ export default function MapApp() {
     setListings(null); setListTotal(0); setDataSource(null); setLoading(true);
 
     const controller = new AbortController();
-    const { signal } = controller;
 
     async function fetchListings() {
       try {
         const purpose = filters.txTypes.includes('Rentals') ? 'for-rent' : 'for-sale';
-        const params = new URLSearchParams({
-          locationId: selectedArea!.bayutId,
-          purpose,
-          page: '1',
-        });
-        const res = await fetch(`/api/dld/transactions?${params}`, { signal });
+        const params  = new URLSearchParams({ locationId: selectedArea!.bayutId, purpose, page: '1' });
+        const res     = await fetch(`/api/dld/transactions?${params}`, { signal: controller.signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json() as { listings: NormalisedListing[]; total: number };
         const rows = data.listings ?? [];
@@ -369,40 +567,75 @@ export default function MapApp() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedArea]);
 
+  // ── Border visibility
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const vis = showBorders ? 'visible' : 'none';
+    try { map.setLayoutProperty('area-borders-fill', 'visibility', vis); } catch { /* */ }
+    try { map.setLayoutProperty('area-borders-line', 'visibility', vis); } catch { /* */ }
+  }, [showBorders, mapReady]);
+
+  // ── Traffic visibility
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    try { map.setLayoutProperty('traffic-layer', 'visibility', showTraffic ? 'visible' : 'none'); } catch { /* */ }
+  }, [showTraffic, mapReady]);
+
   // ── Style change
   const changeStyle = (s: MapStyle) => {
     const map = mapRef.current; if (!map) return;
-    map.setStyle(MAP_STYLES[s]); setMapStyle(s);
+    currentStyleRef.current = s;
+    map.setStyle(MAP_STYLES[s]);
+    setMapStyle(s);
     map.once('style.load', () => {
-      setupLayers(map, areasGeoJSONRef.current);
-      if (heatmap && map.getLayer('price-heatmap')) map.setLayoutProperty('price-heatmap','visibility','visible');
+      setupLayers(map, areasGeoJSONRef.current, s);
+      if (heatmap && map.getLayer('price-heatmap')) map.setLayoutProperty('price-heatmap', 'visibility', 'visible');
+      if (showTraffic && map.getLayer('traffic-layer')) map.setLayoutProperty('traffic-layer', 'visibility', 'visible');
+      if (!showBorders) {
+        try { map.setLayoutProperty('area-borders-fill', 'visibility', 'none'); } catch { /* */ }
+        try { map.setLayoutProperty('area-borders-line', 'visibility', 'none'); } catch { /* */ }
+      }
       if (areasGeoJSONRef.current) {
         (map.getSource('areas') as mapboxgl.GeoJSONSource | undefined)?.setData(areasGeoJSONRef.current as unknown as GeoJSON.FeatureCollection);
-        (map.getSource('heatmap-data') as mapboxgl.GeoJSONSource | undefined)?.setData({ type:'FeatureCollection', features: areasGeoJSONRef.current.features.map(f => ({ type:'Feature' as const, geometry:f.geometry, properties:{ weight:1 } })) });
+        (map.getSource('heatmap-data') as mapboxgl.GeoJSONSource | undefined)?.setData({
+          type: 'FeatureCollection',
+          features: areasGeoJSONRef.current.features.map(f => ({ type: 'Feature' as const, geometry: f.geometry, properties: { weight: 1 } })),
+        });
       }
     });
   };
 
   const toggleHeatmap = () => {
     const map = mapRef.current; if (!map || !map.getLayer('price-heatmap')) return;
-    const next = !heatmap; map.setLayoutProperty('price-heatmap','visibility', next?'visible':'none'); setHeatmap(next);
+    const next = !heatmap;
+    map.setLayoutProperty('price-heatmap', 'visibility', next ? 'visible' : 'none');
+    setHeatmap(next);
   };
 
-  const closePanel = () => { setSelectedArea(null); setListings(null); setListTotal(0); mapRef.current?.flyTo({ center:[55.2708,25.2048], zoom:11, pitch:45, speed:0.7 }); };
+  const rotateBearing = (delta: number) => {
+    const map = mapRef.current; if (!map) return;
+    map.rotateTo(map.getBearing() + delta, { duration: 400 });
+  };
+
+  const closePanel = () => {
+    setSelectedArea(null); setListings(null); setListTotal(0);
+    mapRef.current?.flyTo({ center: [55.2708, 25.2048], zoom: 11, pitch: 45, speed: 0.7 });
+  };
 
   const isAdmin  = plan === 'admin';
   const showAll  = isAdmin || plan === 'pro';
   const rowLimit = showAll ? 50 : 10;
 
-  const stats     = listings?.length ? computeStats(listings, listTotal) : null;
-  const priceChart = listings?.length ? priceByBedroomChart(listings) : null;
-  const bedChart  = listings?.length ? bedroomMixChart(listings) : null;
-  const typeChart = listings?.length ? propTypeChart(listings) : null;
+  const stats       = listings?.length ? computeStats(listings, listTotal) : null;
+  const priceChart  = listings?.length ? priceByBedroomChart(listings) : null;
+  const bedChart    = listings?.length ? bedroomMixChart(listings) : null;
+  const typeChart   = listings?.length ? propTypeChart(listings) : null;
 
   const displayListings = listings?.filter(l => {
     if (filters.propTypes.length) {
-      const match = filters.propTypes.some(pt => l.propType.toLowerCase().includes(pt.toLowerCase()));
-      if (!match) return false;
+      return filters.propTypes.some(pt => l.propType.toLowerCase().includes(pt.toLowerCase()));
     }
     return true;
   }) ?? null;
@@ -410,14 +643,31 @@ export default function MapApp() {
   if (!plan) return <LoginScreen onLogin={setPlan} />;
 
   return (
-    <div className="relative w-full h-screen overflow-hidden" style={{ background:'#0d0f14' }}>
+    <div className="relative w-full h-screen overflow-hidden" style={{ background: '#0d0f14' }}>
       <div ref={mapContainer} className="absolute inset-0" />
-      {!hasToken && <NoTokenWarning />}
 
-      {/* Header */}
+      {/* No token warning */}
+      {!hasToken && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center pointer-events-none">
+          <div className="rounded-xl border px-6 py-5 max-w-sm text-center pointer-events-auto"
+            style={{ background:'rgba(30,35,48,0.97)', borderColor:'#f59e0b' }}>
+            <div className="text-2xl mb-2">🗺️</div>
+            <div className="text-sm font-bold text-[#f59e0b] mb-1">Mapbox token not configured</div>
+            <div className="text-[11px] text-[#94a3b8] leading-relaxed mb-3">
+              Add <code className="text-[#10b981]">NEXT_PUBLIC_MAPBOX_TOKEN</code> to Vercel environment variables.
+            </div>
+            <a href="https://account.mapbox.com" target="_blank" rel="noreferrer"
+              className="inline-block text-xs font-semibold px-4 py-2 rounded-lg" style={{ background:'#f59e0b', color:'#0d0f14' }}>
+              Get free token → mapbox.com
+            </a>
+          </div>
+        </div>
+      )}
+
+      {/* ── Header ── */}
       <header className="absolute top-0 left-0 right-0 z-40 flex items-center gap-3 px-4 border-b"
-        style={{ height:56, background:'rgba(13,15,20,0.93)', backdropFilter:'blur(12px)', borderColor:'#2a3040' }}>
-        <button onClick={() => setSidebarOpen(o=>!o)} className="w-8 h-8 rounded-md flex items-center justify-center border"
+        style={{ height: 56, background: 'rgba(13,15,20,0.93)', backdropFilter: 'blur(12px)', borderColor: '#2a3040' }}>
+        <button onClick={() => setSidebarOpen(o => !o)} className="w-8 h-8 rounded-md flex items-center justify-center border"
           style={{ background:'#1e2330', borderColor:'#2a3040', color:'#94a3b8' }}>☰</button>
         <div className="text-lg font-bold text-[#3b82f6] whitespace-nowrap">PropMap <span className="text-sm font-normal text-[#94a3b8]">Dubai</span></div>
         <div className="flex-1 max-w-sm relative">
@@ -425,21 +675,47 @@ export default function MapApp() {
           <input className="w-full rounded-lg pl-8 pr-3 py-2 text-sm outline-none border"
             style={{ background:'#1e2330', borderColor:'#2a3040', color:'#e2e8f0' }} placeholder="Search community…" />
         </div>
+
         <div className="flex items-center gap-2 ml-auto">
+          {/* Traffic toggle + window selector */}
+          <div className="flex items-center gap-1 rounded-lg border px-1.5 py-1"
+            style={{ background: showTraffic ? 'rgba(239,68,68,.08)' : 'transparent', borderColor: showTraffic ? '#ef4444' : '#2a3040' }}>
+            <button onClick={() => setShowTraffic(t => !t)} className="text-[11px] font-semibold px-2 py-0.5 rounded"
+              style={{ color: showTraffic ? '#ef4444' : '#64748b' }}>
+              🚦 Traffic
+            </button>
+            {showTraffic && (
+              <select value={trafficWin} onChange={e => setTrafficWin(e.target.value as TrafficWin)}
+                className="text-[10px] rounded border-0 outline-none cursor-pointer"
+                style={{ background:'transparent', color:'#94a3b8' }}>
+                <option value="live">Live</option>
+                <option value="morning">Morning Rush</option>
+                <option value="evening">Evening Rush</option>
+              </select>
+            )}
+          </div>
+
           <button onClick={toggleHeatmap} className="px-3 py-1.5 rounded-full text-xs font-semibold border"
             style={{ background:heatmap?'rgba(239,68,68,.15)':'transparent', borderColor:heatmap?'#ef4444':'#2a3040', color:heatmap?'#ef4444':'#94a3b8' }}>
             🌡️ Heatmap
           </button>
+
+          <button onClick={() => setShowBorders(b => !b)} className="px-3 py-1.5 rounded-full text-xs font-semibold border"
+            style={{ background:showBorders?'rgba(59,130,246,.12)':'transparent', borderColor:showBorders?'#3b82f6':'#2a3040', color:showBorders?'#3b82f6':'#94a3b8' }}>
+            ⬡ Borders
+          </button>
+
           {areasLoading
             ? <span className="text-[11px] text-[#64748b] flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-t-transparent border-[#3b82f6] animate-spin"/>Loading…</span>
             : <span className="text-[11px] text-[#10b981]">✓ {areaNames.length} areas</span>}
+
           {isAdmin && <span className="text-[11px] font-bold px-2.5 py-1 rounded-full" style={{ background:'rgba(16,185,129,.15)', border:'1px solid rgba(16,185,129,.3)', color:'#10b981' }}>ADMIN</span>}
-          {plan==='pro' && <span className="text-[11px] font-bold px-2.5 py-1 rounded-full border" style={{ borderColor:'#3b82f6', color:'#3b82f6' }}>PRO</span>}
+          {plan === 'pro' && <span className="text-[11px] font-bold px-2.5 py-1 rounded-full border" style={{ borderColor:'#3b82f6', color:'#3b82f6' }}>PRO</span>}
           <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold" style={{ background:'linear-gradient(135deg,#3b82f6,#10b981)' }}>C</div>
         </div>
       </header>
 
-      {/* Sidebar */}
+      {/* ── Sidebar ── */}
       <aside className="absolute z-30 overflow-y-auto border-r transition-transform duration-300"
         style={{ top:56, left:0, bottom:0, width:272, background:'rgba(13,15,20,0.93)', backdropFilter:'blur(12px)', borderColor:'#2a3040', transform:sidebarOpen?'translateX(0)':'translateX(-100%)' }}>
 
@@ -482,6 +758,24 @@ export default function MapApp() {
           </div>
         ) : null}
 
+        {/* Traffic time window info */}
+        {showTraffic && (
+          <div className="p-4 border-t" style={{ borderColor:'#2a3040' }}>
+            <div className="text-[10px] font-bold uppercase tracking-widest text-[#64748b] mb-2">Traffic View</div>
+            <div className="text-[11px] text-[#94a3b8] mb-2">{TRAFFIC_LABELS[trafficWin]}</div>
+            <div className="flex flex-col gap-1.5">
+              {(['live','morning','evening'] as TrafficWin[]).map(w => (
+                <button key={w} onClick={() => setTrafficWin(w)}
+                  className="text-left text-[11px] px-2.5 py-1.5 rounded-lg border transition-all"
+                  style={{ background:trafficWin===w?'rgba(239,68,68,.1)':'transparent', borderColor:trafficWin===w?'#ef4444':'#2a3040', color:trafficWin===w?'#ef4444':'#64748b' }}>
+                  {TRAFFIC_LABELS[w]}
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 text-[10px] text-[#475569]">Live traffic from Mapbox. Time window labels show typical congestion periods.</div>
+          </div>
+        )}
+
         <div className="p-4 border-t" style={{ borderColor:'#2a3040' }}>
           <div className="text-[10px] font-bold uppercase tracking-widest text-[#64748b] mb-2">Data Source</div>
           <div className="flex items-center gap-2 text-[11px] text-[#94a3b8]">
@@ -502,12 +796,11 @@ export default function MapApp() {
         </div>
       </aside>
 
-      {/* Right Detail Panel */}
+      {/* ── Right Detail Panel ── */}
       <aside className="absolute top-14 right-0 bottom-0 overflow-y-auto z-30 border-l transition-transform duration-300"
         style={{ width:400, background:'rgba(13,15,20,0.96)', backdropFilter:'blur(16px)', borderColor:'#2a3040', transform:selectedArea?'translateX(0)':'translateX(100%)' }}>
         {selectedArea && (
           <>
-            {/* Panel header */}
             <div className="sticky top-0 z-10 p-4 border-b flex items-start justify-between"
               style={{ background:'rgba(13,15,20,0.98)', backdropFilter:'blur(12px)', borderColor:'#2a3040' }}>
               <div>
@@ -516,13 +809,14 @@ export default function MapApp() {
                   <span className="text-[11px] font-semibold text-[#10b981]">✓ Bayut Live Data</span>
                 </div>
                 <div className="text-base font-bold">{selectedArea.name}</div>
-                <div className="text-[11px] text-[#64748b] mt-0.5">Dubai · {listTotal > 0 ? `${listTotal.toLocaleString()} active listings` : 'Loading…'}</div>
+                <div className="text-[11px] text-[#64748b] mt-0.5">
+                  Dubai · {listTotal > 0 ? `${listTotal.toLocaleString()} active listings` : 'Loading…'}
+                </div>
               </div>
               <button onClick={closePanel} className="w-7 h-7 rounded-md flex items-center justify-center text-xs border flex-shrink-0 ml-3"
                 style={{ background:'#1e2330', borderColor:'#2a3040', color:'#94a3b8' }}>✕</button>
             </div>
 
-            {/* Tabs */}
             <div className="flex border-b" style={{ borderColor:'#2a3040' }}>
               {(['overview','listings','trends'] as ActiveTab[]).map(tab => (
                 <button key={tab} onClick={() => setActiveTab(tab)}
@@ -533,7 +827,7 @@ export default function MapApp() {
               ))}
             </div>
 
-            {/* ── Overview */}
+            {/* Overview */}
             {activeTab === 'overview' && (
               <div className="p-4 space-y-4">
                 {loading ? (
@@ -578,7 +872,7 @@ export default function MapApp() {
               </div>
             )}
 
-            {/* ── Listings */}
+            {/* Listings */}
             {activeTab === 'listings' && (
               <div className="p-4">
                 <div className="flex items-center gap-2 mb-3">
@@ -605,11 +899,11 @@ export default function MapApp() {
                           const blurred = !showAll && i >= 10;
                           return (
                             <tr key={l.id ?? i} style={{ opacity:blurred?.3:1, filter:blurred?'blur(4px)':'none', userSelect:blurred?'none':'auto', borderBottom:'1px solid rgba(42,48,64,.4)' }}>
-                              <td className="py-2 px-1.5 text-[11px] font-semibold text-[#3b82f6]">{l.price ? (l.price >= 1e6 ? (l.price/1e6).toFixed(2)+'M' : l.price.toLocaleString()) : '—'}</td>
-                              <td className="py-2 px-1.5 text-[11px]">{l.rooms === 0 ? 'Studio' : l.rooms}</td>
-                              <td className="py-2 px-1.5 text-[11px] text-[#94a3b8]">{l.baths ?? '—'}</td>
-                              <td className="py-2 px-1.5 text-[11px] text-right text-[#94a3b8]">{l.areaSqft ? l.areaSqft.toLocaleString() : '—'}</td>
-                              <td className="py-2 px-1.5 text-[11px] text-[#94a3b8]">{l.propType?.replace(/s$/,'') ?? '—'}</td>
+                              <td className="py-2 px-1.5 text-[11px] font-semibold text-[#3b82f6]">{l.price?(l.price>=1e6?(l.price/1e6).toFixed(2)+'M':l.price.toLocaleString()):'—'}</td>
+                              <td className="py-2 px-1.5 text-[11px]">{l.rooms===0?'St':l.rooms}</td>
+                              <td className="py-2 px-1.5 text-[11px] text-[#94a3b8]">{l.baths??'—'}</td>
+                              <td className="py-2 px-1.5 text-[11px] text-right text-[#94a3b8]">{l.areaSqft?l.areaSqft.toLocaleString():'—'}</td>
+                              <td className="py-2 px-1.5 text-[11px] text-[#94a3b8]">{l.propType?.replace(/s$/,'')??'—'}</td>
                               <td className="py-2 px-1.5">
                                 <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
                                   style={{ background:l.status==='Ready'?'rgba(16,185,129,.15)':'rgba(245,158,11,.15)', color:l.status==='Ready'?'#10b981':'#f59e0b' }}>
@@ -638,7 +932,7 @@ export default function MapApp() {
               </div>
             )}
 
-            {/* ── Trends */}
+            {/* Trends */}
             {activeTab === 'trends' && (
               <div className="p-4 space-y-4">
                 {loading ? (
@@ -656,7 +950,9 @@ export default function MapApp() {
                         </div>
                       </div>
                     ) : listings && (
-                      <div className="rounded-lg p-4 border text-center" style={{ background:'#1e2330', borderColor:'#2a3040' }}><div className="text-[12px] text-[#64748b]">No bedroom data available.</div></div>
+                      <div className="rounded-lg p-4 border text-center" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
+                        <div className="text-[12px] text-[#64748b]">No bedroom data available.</div>
+                      </div>
                     )}
                     {!listings && !loading && (
                       <div className="rounded-lg p-6 border text-center" style={{ background:'#1e2330', borderColor:'#2a3040' }}>
@@ -672,8 +968,8 @@ export default function MapApp() {
         )}
       </aside>
 
-      {/* Map style buttons */}
-      <div className="absolute bottom-6 z-30 flex gap-1.5 transition-all duration-300" style={{ left:sidebarOpen?284:16 }}>
+      {/* ── Map style buttons (bottom left) ── */}
+      <div className="absolute bottom-6 z-30 flex gap-1.5 transition-all duration-300" style={{ left: sidebarOpen ? 284 : 16 }}>
         {(['dark','satellite','streets'] as MapStyle[]).map(s => (
           <button key={s} onClick={() => changeStyle(s)} className="px-3 py-1.5 rounded-full text-[11px] font-semibold border capitalize"
             style={{ background:mapStyle===s?'#3b82f6':'rgba(13,15,20,0.9)', backdropFilter:'blur(8px)', borderColor:mapStyle===s?'#3b82f6':'#2a3040', color:mapStyle===s?'#fff':'#94a3b8' }}>
@@ -682,23 +978,53 @@ export default function MapApp() {
         ))}
       </div>
 
-      {/* Zoom controls */}
-      <div className="absolute bottom-6 right-4 z-30 flex flex-col gap-1.5">
-        {[{l:'+',a:()=>mapRef.current?.zoomIn()},{l:'−',a:()=>mapRef.current?.zoomOut()},{l:'⌖',a:()=>mapRef.current?.resetNorth()}].map(({l,a})=>(
-          <button key={l} onClick={a} className="w-9 h-9 rounded-lg flex items-center justify-center border"
-            style={{ background:'rgba(13,15,20,0.9)', backdropFilter:'blur(8px)', borderColor:'#2a3040', color:'#94a3b8' }}>{l}</button>
-        ))}
+      {/* ── Right control cluster (zoom indicator + camera controls) ── */}
+      <div className="absolute bottom-6 right-4 z-30 flex flex-col items-center gap-1.5">
+        {/* Zoom level indicator */}
+        <div className="rounded-lg px-2.5 py-1.5 border text-center min-w-[56px]"
+          style={{ background:'rgba(13,15,20,0.9)', backdropFilter:'blur(8px)', borderColor:'#2a3040' }}>
+          <div className="text-[9px] text-[#475569] font-semibold uppercase tracking-wide">Zoom</div>
+          <div className="text-[13px] font-bold text-[#e2e8f0]">{zoomLevel.toFixed(1)}</div>
+        </div>
+
+        {/* Rotation */}
+        <div className="flex gap-1">
+          <IconBtn label="↺" title="Rotate left" onClick={() => rotateBearing(-45)} />
+          <IconBtn label="↻" title="Rotate right" onClick={() => rotateBearing(45)} />
+        </div>
+
+        {/* Pitch / north reset */}
+        <IconBtn label="⌖" title="Reset north" onClick={() => { mapRef.current?.resetNorth(); mapRef.current?.easeTo({ pitch: 45 }); }} />
+
+        {/* Zoom in / out */}
+        <IconBtn label="+" title="Zoom in"  onClick={() => mapRef.current?.zoomIn()} />
+        <IconBtn label="−" title="Zoom out" onClick={() => mapRef.current?.zoomOut()} />
       </div>
 
-      {/* Legend */}
+      {/* ── Legend ── */}
       <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 flex gap-4 items-center rounded-full px-4 py-2 border"
         style={{ background:'rgba(13,15,20,0.9)', backdropFilter:'blur(8px)', borderColor:'#2a3040' }}>
-        {[['#3b82f6','Active listings area'],['rgba(239,68,68,0.7)','Heatmap intensity']].map(([c,l])=>(
-          <div key={l} className="flex items-center gap-1.5 text-[11px] text-[#94a3b8]"><div className="w-2 h-2 rounded-full" style={{ background:c }}/>{l}</div>
+        {[
+          ['#3b82f6','Area (click for data)'],
+          ['rgba(59,130,246,0.4)','Area boundary'],
+          ['rgba(239,68,68,0.7)','Heatmap'],
+        ].map(([c,l]) => (
+          <div key={l} className="flex items-center gap-1.5 text-[11px] text-[#94a3b8]">
+            <div className="w-2 h-2 rounded-full" style={{ background:c }}/>{l}
+          </div>
         ))}
+        {showTraffic && (
+          <div className="flex items-center gap-2 border-l pl-4" style={{ borderColor:'#2a3040' }}>
+            {[['#10b981','Low'],['#f59e0b','Moderate'],['#ef4444','Heavy']].map(([c,l]) => (
+              <div key={l} className="flex items-center gap-1 text-[11px] text-[#94a3b8]">
+                <div className="w-3 h-1.5 rounded-sm" style={{ background:c }}/>{l}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Toast */}
+      {/* ── Toast ── */}
       <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 rounded-lg px-5 py-2.5 text-sm border pointer-events-none whitespace-nowrap transition-opacity duration-300"
         style={{ background:'#1e2330', borderColor:'#2a3040', opacity:toast?1:0 }}>
         {toast}
